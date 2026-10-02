@@ -25,7 +25,14 @@ except ModuleNotFoundError as exc:
 # dir, so if IT can't import nothing in hermes_cli can.
 from hermes_cli import _early_recovery as _early_recovery_mod
 
-if _early_recovery_mod.restore_interrupted_pull():
+from pathlib import Path as _AdmissionPath
+import sys as _admission_sys
+from hermes_cli.venv_sync import patch_stack_launch_admission as _patch_stack_launch_admission
+
+_patch_stack_admitted = _patch_stack_launch_admission(
+    _AdmissionPath(__file__).resolve().parents[1], _admission_sys.argv[1:]
+)
+if not _patch_stack_admitted and _early_recovery_mod.restore_interrupted_pull():
     _early_recovery_mod.relaunch_after_restore()
 
 # Windows: neutralize CPython's ``platform._syscmd_ver`` before anything else
@@ -660,6 +667,41 @@ def _apply_profile_override() -> None:
 
 
 _apply_profile_override()
+
+# A configured read-only update must not import config's provider-discovery
+# graph: it calls load_config(), which creates the profile skeleton on import.
+# Use the shipped parser and the updater-owned report, before that graph.
+if _patch_stack_admitted:
+    from hermes_cli._parser import command_argv as _admission_command_argv
+
+    _admission_command = _admission_command_argv(sys.argv[1:])
+    if {"--check", "--plan"} & set(_admission_command[1:]):
+        import argparse as _admission_argparse
+        import hermes_yaml as _admission_yaml
+        from hermes_constants import get_process_hermes_home as _admission_home
+        from hermes_cli.update_patch_stack import read_policy as _admission_policy, PatchStackError
+        from hermes_cli.subcommands.update import build_update_parser as _admission_parser
+
+        _read_parser = _admission_argparse.ArgumentParser(prog="hermes")
+        _admission_parser(_read_parser.add_subparsers(), cmd_update=lambda args: None)
+        _read_args = _read_parser.parse_args(_admission_command)
+        try:
+            _read_config = _admission_yaml.safe_load(
+                (_admission_home() / "config.yaml").read_text(encoding="utf-8-sig")
+            ) or {}
+            _read_policy = _admission_policy(_read_config, _AdmissionPath(_bootstrap_root))
+            if _read_policy is not None:
+                if any(getattr(_read_args, name, None) for name in (
+                    "branch", "channel", "set_channel", "switch_branch", "keep_stash",
+                    "set_patch_stack", "clear_patch_stack",
+                )):
+                    raise PatchStackError("Patch-stack preview rejects policy/target overrides")
+                from hermes_cli.update_cmd_check import report_patch_stack as _readonly_report
+                _readonly_report(_AdmissionPath(_bootstrap_root), _read_policy)
+                raise SystemExit(0)
+        except (ValueError, OSError, _admission_yaml.YAMLError) as _read_error:
+            print(f"hermes: {_read_error}", file=sys.stderr)
+            raise SystemExit(2) from None
 # ``-p``/active_profile re-homed the process after hermes_bootstrap ran: re-point the temp vars
 # at THIS home's scratch dir (a user-set TMPDIR is still left alone).
 try:
@@ -741,14 +783,15 @@ except Exception:
 try:
     from hermes_logging import setup_logging as _setup_logging
 
-    _setup_logging(
-        mode=(
-            "gui"
-            if next((arg for arg in sys.argv[1:] if not arg.startswith("-")), "")
-            in {"dashboard", "serve", "gui", "desktop"}
-            else "cli"
+    if not _patch_stack_admitted:
+        _setup_logging(
+            mode=(
+                "gui"
+                if next((arg for arg in sys.argv[1:] if not arg.startswith("-")), "")
+                in {"dashboard", "serve", "gui", "desktop"}
+                else "cli"
+            )
         )
-    )
 except Exception:
     pass  # best-effort — don't crash the CLI if logging setup fails
 
@@ -2414,6 +2457,11 @@ def _finalize_update_receipt(code: int, reason: str) -> None:
 
 def _update_preflight_handled(args) -> bool:
     """Managed-install refusal, --plan, admission gate, --check. True = nothing more to do."""
+    from hermes_cli.update_cmd import dispatch_patch_stack
+    if dispatch_patch_stack(
+        args, gateway_mode=getattr(args, "gateway", False), preflight_only=True
+    ):
+        return True
     from hermes_cli.config import is_managed, managed_error
     from hermes_cli.update_channel import handle_metadata_args
 

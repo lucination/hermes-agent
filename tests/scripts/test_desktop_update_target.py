@@ -168,7 +168,7 @@ def _assert_forwarded(
         (home / ".hermes-update-result.json").read_text(encoding="utf-8-sig")
     )
     assert receipt["ok"]
-    assert receipt["channel"] == (expected[1] if expected[0] == "--channel" else "")
+    assert receipt["channel"] == (expected[1] if expected and expected[0] == "--channel" else "")
     assert not (home / ".hermes-update-in-progress").exists()
 
 
@@ -190,7 +190,7 @@ def test_windows_channel_survives_retry_in_active_profile(tmp_path, channel):
 @pytest.mark.parametrize(
     "target, expected",
     [
-        ([], ["--branch", "main"]),
+        ([], []),
         (["--branch", "feature/target"], ["--branch", "feature/target"]),
     ],
 )
@@ -202,12 +202,19 @@ def test_posix_legacy_branch_and_default_home(tmp_path, target, expected):
 @pytest.mark.parametrize(
     "target, expected",
     [
-        ([], ["--branch", "main"]),
+        ([], []),
         (["-Branch", "feature/target"], ["--branch", "feature/target"]),
     ],
 )
 def test_windows_legacy_branch_and_default_home(tmp_path, target, expected):
     _assert_forwarded(tmp_path, target, expected, windows=True, inherited_home=False)
+
+
+def test_windows_native_policy_transport_has_no_implicit_defaults():
+    source = (SCRIPTS / 'windows.ps1').read_text(encoding='utf-8-sig')
+    assert '[string]$Branch = ""' in source
+    assert '$targetArgs = @()' in source
+    assert 'if ($targetArgs.Count -gt 0 -and $updateHelp -match "--keep-stash")' in source
 
 
 def _assert_rejected(tmp_path, target, *, windows=False):

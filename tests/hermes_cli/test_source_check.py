@@ -542,3 +542,56 @@ def test_branch_tip_failure_names_the_cause(installation):
     status = check_for_updates(install_root=root, home=home, force=True)
     assert status["error"] == "fetch-failed"
     assert "HTTP 503" in status["message"]
+
+
+@pytest.mark.parametrize('remote_only', [False, True])
+def test_patch_stack_status_is_policy_owned_and_readonly(installation, remote_only):
+    from hermes_cli.source_check import check_for_updates
+    from hermes_cli.update_patch_stack import base_ref
+    from hermes_cli.update_channel import install_id
+
+    root, linked, home, base, head, responses, requests, git = installation
+    remote = root.parent / 'upstream'
+    git('clone', str(root), str(remote))
+    git('remote', 'add', 'upstream', str(remote))
+    git('update-ref', base_ref(linked), base, cwd=linked)
+    target = head
+    if remote_only:
+        git('commit', '--allow-empty', '-m', 'unfetched upstream', cwd=remote)
+        target = git('rev-parse', 'HEAD', cwd=remote)
+    policy = dict(branch='feature/gui', base_remote='upstream', base_branch='main',
+                  remote_url=str(remote), anchor_sha=base)
+    (home / 'config.yaml').write_text(json.dumps({'update': {'installs': {
+        install_id(linked): {'channel': 'main', 'patch_stack': policy}}}}))
+    branch_file = home / 'branch.json'
+    branch_file.write_text(json.dumps({'branch': 'deleted'}))
+    def snapshot(directory):
+        return {str(p.relative_to(directory)): p.read_bytes() for p in directory.rglob('*') if p.is_file()}
+    before_git, before_home = snapshot(root / '.git'), snapshot(home)
+    status = check_for_updates(install_root=linked, home=home, branch_config_path=branch_file,
+                               branch='deleted', channel='stable', force=True)
+    assert status['patch_stack']['branch'] == 'feature/gui'
+    assert status['patch_stack']['base_remote'] == 'upstream'
+    assert status['patch_stack']['baseSha'] == base
+    assert status['branch'] == 'feature/gui'
+    assert status['targetSha'] == target
+    assert 'channel' not in status
+    assert status['patch_stack']['ancestry'] == ('unknown' if remote_only else 'forward')
+    assert status['updateAvailable'] is (None if remote_only else True)
+    assert requests == []
+    assert snapshot(root / '.git') == before_git
+    assert snapshot(home) == before_home
+    # The actual Desktop probe runs in a new process; cold imports must not
+    # initialize the profile or hide behind this test process's config cache.
+    import os
+    import sys
+    from pathlib import Path
+    result = subprocess.run([
+        sys.executable, '-B', '-m', 'hermes_cli.source_check', '--install-root', str(linked),
+        '--home', str(home), '--branch-config-path', str(branch_file), '--force',
+    ], cwd=Path(__file__).resolve().parents[2], env={**os.environ, 'HERMES_HOME': str(home)},
+        text=True, capture_output=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)['patch_stack']['baseSha'] == base
+    assert snapshot(home) == before_home
+    assert snapshot(root / '.git') == before_git

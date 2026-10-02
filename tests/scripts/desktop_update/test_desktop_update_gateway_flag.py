@@ -80,7 +80,7 @@ def test_no_gateway_flag_omits_gateway_from_update(tmp_path):
     flag must survive the hand-off's own retry path — every update invocation
     is checked, not just the first.
     """
-    calls = _run_handoff(tmp_path, ["--no-gateway"])
+    calls = _run_handoff(tmp_path, ["--no-gateway", "--branch", "main"])
 
     update_calls = [c for c in calls if " update " in f" {c} "]
     assert update_calls, "hand-off never ran hermes update"
@@ -89,3 +89,14 @@ def test_no_gateway_flag_omits_gateway_from_update(tmp_path):
         assert "--gateway" not in argv, f"--gateway reappeared in update argv: {call}"
         assert "--keep-stash" in argv, "--no-gateway must not disturb --keep-stash"
         assert "--yes" in argv
+
+
+@requires_posix_handoff
+def test_policy_owned_handoff_has_no_implicit_override(tmp_path):
+    calls = _run_handoff(tmp_path, [])
+    update_calls = [c.split() for c in calls if " update " in f" {c} "]
+    assert update_calls
+    for argv in update_calls:
+        assert '--branch' not in argv
+        assert '--channel' not in argv
+        assert '--keep-stash' not in argv

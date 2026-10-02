@@ -651,6 +651,9 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False, ch
         print("✗ Not a git repository — cannot check for updates.")
         sys.exit(1)
 
+    from types import SimpleNamespace
+    if dispatch_patch_stack(SimpleNamespace(check=True, branch=branch if branch_explicit else None, channel=channel)):
+        return
     git_cmd = _base_git_cmd()
     # The check fetches over HTTPS too; give git the same CA bundle Python
     # uses, or --check fails where the apply path succeeds (see
@@ -1430,12 +1433,132 @@ def _apply_pulled_update(
     _complete_source_update(completion_request)
 
 
+def dispatch_patch_stack(args, *, gateway_mode: bool = False, preflight_only: bool = False) -> bool:
+    """Handle an opted-in install before any legacy checkout mutation."""
+    from hermes_cli import update_patch_stack as stack
+    from hermes_cli.config import require_readable_config_before_write
+    root = _m().PROJECT_ROOT
+    from hermes_cli.venv_sync import pending_patch_stack_transaction
+    pending = pending_patch_stack_transaction(root)
+    if pending is not None and not (getattr(args, 'check', False) or getattr(args, 'plan', False)):
+        print(f'✗ Patch-stack pending transaction: {pending}; explicit recovery required.')
+        raise SystemExit(2)
+    if getattr(args, 'set_patch_stack', None) is not None:
+        try:
+            policy = stack.configure(root, args.set_patch_stack, getattr(args, 'base', None))
+        except ValueError as exc:
+            print(f'✗ {exc}')
+            raise SystemExit(2) from exc
+        print(f'→ Configured patch stack {policy.branch} onto {policy.base_remote}/{policy.base_branch}; no code moved.')
+        return True
+    if getattr(args, 'clear_patch_stack', False):
+        stack.clear(root)
+        print('→ Patch-stack policy cleared; no code moved. Subsequent updates may switch to main.')
+        return True
+    try:
+        config = require_readable_config_before_write()
+        policy = stack.read_policy(config, root)
+    except ValueError as exc:
+        print(f'✗ Patch-stack policy refused: {exc}')
+        raise SystemExit(2) from exc
+    if policy is None:
+        if pending is not None:
+            print(f'✗ Patch-stack pending transaction: {pending}; explicit recovery required.')
+            raise SystemExit(2)
+        return False
+    from hermes_cli.update_channel import _read_stamp, _package_channel, resolve_update_channel
+    from hermes_cli.update_contract import evaluate_update_admission
+    stamp = _read_stamp(root)
+    refusal = evaluate_update_admission(root)
+    if (refusal is not None or _package_channel(stamp)
+            or stamp.get('updateMechanism') not in (None, 'self')
+            or not (root / '.git').exists()
+            or resolve_update_channel(config, root) != 'main'):
+        print('✗ Patch stacks support source Git installs on main channel only.')
+        raise SystemExit(2)
+    incompatible = [name for name in ('branch', 'channel', 'set_channel', 'switch_branch', 'keep_stash')
+                    if getattr(args, name, None)]
+    if incompatible:
+        print('✗ Patch-stack policy rejects ' + ', '.join('--' + name.replace('_', '-') for name in incompatible)
+              + '; clear the policy explicitly first.')
+        raise SystemExit(2)
+    if getattr(args, 'check', False) or getattr(args, 'plan', False):
+        _check.report_patch_stack(root, policy)
+        return True
+    if preflight_only:
+        return False
+    opts = _resolve_update_options(args, gateway_mode)
+    plan = _begin_update_receipt_and_plan(args)
+    snapshot = _m()._run_pre_update_backup(args)
+    _record_pre_update_backup_outcome(args, snapshot)
+    _record_snapshot_stage(args, snapshot)
+    desktop_dir = root / 'apps' / 'desktop'
+    desktop = (_m()._desktop_packaged_executable(desktop_dir) is not None
+               or _m()._desktop_dist_exists(desktop_dir) or bool(_m()._installed_desktop_apps()))
+    with stack.repository_lock(root):
+        candidate = None
+        journal_file = None
+        try:
+            journal_file = stack.journal_path(root)
+            candidate = stack.stage(root, policy)
+            applied = stack.apply(root, policy, candidate)
+        except BaseException as exc:
+            # Inspect publication facts for every failure, including IO/fsync and
+            # cancellation. Never reinterpret a published ref as a failed update.
+            if candidate is not None and (candidate.head != candidate.original or candidate.target != candidate.base):
+                try:
+                    published = (stack.sha(root, f'refs/heads/{policy.branch}') == candidate.head
+                                 and stack.sha(root, stack.base_ref(root)) == candidate.target)
+                except BaseException:
+                    # The durable phase follows the ref transaction. Reading it
+                    # directly still works when spawning Git itself is unavailable.
+                    try:
+                        import json
+                        assert journal_file is not None  # Captured before staging could succeed.
+                        journal = json.loads(journal_file.read_text())
+                        published = (journal.get('head') == candidate.head
+                                     and journal.get('phase') in ('publishing-files', 'applied'))
+                    except BaseException:
+                        published = False
+                if published:
+                    _completion_receipt.record_fact('code_published', True)
+                    _completion_receipt.record_fact('patch_stack', {
+                        'branch': policy.branch, 'base': candidate.target, 'head': candidate.head,
+                        'dropped': list(candidate.dropped), 'publication_incomplete': True})
+            print(f'✗ Patch-stack update stopped: {exc}')
+            _completion_receipt.finalize_update_receipt('failed', stop_reason=str(exc))
+            if isinstance(exc, stack.PatchStackError):
+                raise SystemExit(1) from exc
+            raise
+        try:
+            _completion_receipt.record_fact("code_published", True)
+            _completion_receipt.record_fact("patch_stack", {
+                "branch": policy.branch, "base": applied.base, "head": applied.head,
+                "dropped": list(candidate.dropped)})
+            request = _source_completion_request(opts, plan, snapshot, None, desktop, gateway_mode)
+            request.update(branch=policy.branch, expected_sha=applied.head, apply_mode="patch-stack")
+            _completion_receipt.checkpoint_update_receipt()
+            # Atomically replace the applied barrier, preserving recovery evidence.
+            # Never delete between publication and completion, even for a no-op.
+            import json
+            journal = json.loads(journal_file.read_text())
+            stack.write_journal(root, {**journal, 'phase': 'completion'})
+            _complete_source_update(request)
+            stack.finish_journal(root)
+        except BaseException:
+            _completion_receipt.finalize_update_receipt('partial', stop_reason='Post-publication completion failed')
+            raise
+    return True
+
+
 def _cmd_update_impl(args, gateway_mode: bool):
     """Apply the update; the command boundary owns errors, receipts and stdio."""
     # Marks this frame as the CURRENT updater for
     # _old_updater.in_historical_update(); historical on-disk updaters do not
     # declare this local, so only they hand off through retired shims.
     _hermes_current_updater_frame = True
+    if dispatch_patch_stack(args, gateway_mode=gateway_mode):
+        return
     git_operation = git_operation_in_progress(_m().PROJECT_ROOT)
     if git_operation:
         root = _m().PROJECT_ROOT

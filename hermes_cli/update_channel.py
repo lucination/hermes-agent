@@ -268,6 +268,25 @@ def _write_channel_record(sha16: str, path: str, channel: str, *,
     from hermes_cli.config import get_config_path
 
     config_path = config_path if config_path is not None else get_config_path()
+    root = Path(path)
+    if (root / '.git').exists():
+        from hermes_cli.update_patch_stack import PatchStackError, repository_lock, require_no_pending
+        if os.name == 'nt':
+            # Native patch-stack writers fail closed on Windows, so there is no
+            # supported setup race here. Preserve ordinary Windows channels,
+            # but never bypass a retained transaction or an opted-in policy.
+            with _channel_write_lock(config_path):
+                require_no_pending(root)
+                from hermes_cli.config import require_readable_config_before_write
+                existing = require_readable_config_before_write(config_path)
+                if 'patch_stack' in channel_record(existing, root):
+                    raise PatchStackError('Repository locking unsupported; fail closed')
+                return _write_channel_record_locked(sha16, path, channel, expected, config_path)
+        # Same lock order as configure: common repository, then config.
+        with repository_lock(root):
+            require_no_pending(root)
+            with _channel_write_lock(config_path):
+                return _write_channel_record_locked(sha16, path, channel, expected, config_path)
     with _channel_write_lock(config_path):
         return _write_channel_record_locked(sha16, path, channel, expected, config_path)
 
@@ -298,6 +317,8 @@ def _write_channel_record_locked(sha16: str, path: str, channel: str,
     if expected is not None and (record or {}) != expected:
         return False
     new_record = dict(record) if isinstance(record, dict) else {}
+    if new_record.get("patch_stack") is not None and channel != "main":
+        raise ValueError("clear patch-stack policy before selecting another channel")
     new_record["path"] = path  # DATA, for humans + doctor GC
     new_record["channel"] = channel
     atomic_roundtrip_yaml_update(config_path, f"update.installs.{sha16}", new_record)

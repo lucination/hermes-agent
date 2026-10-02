@@ -1999,14 +1999,36 @@ Use `--check` to compare with its configured source target without applying
 the update. Desktop bundles, Docker, Nix, and Termux packages retain their
 external update owner. See [Updating & Uninstalling](../getting-started/updating.md).
 
-`hermes update` pulls the configured update branch (default: `main`). If your checkout is on another branch, Hermes may check out the update branch before pulling. Commit branch work before updating when you want to keep it outside the update autostash flow.
+`hermes update` normally pulls the configured update branch (default: `main`). If your checkout is on another branch, Hermes may check out the update branch before pulling. Commit branch work before updating when you want to keep it outside the update autostash flow.
+
+**Opt-in patch-stack mode:** `--set-patch-stack BRANCH --base REMOTE/main`
+records a per-install source Git policy, including remote identity and a verified
+base. Ordinary updates then rebase committed linear patches in a detached
+candidate, validate it, and publish the patch branch and private base together
+before updating files and running completion against the patch head. Dirty or
+untracked trees refuse; there is no autostash, merge/ZIP fallback, automatic
+reset, or push. An enabled policy rejects `--branch`, `--channel`, `--set-channel`,
+`--switch-branch`, and `--keep-stash`. Setup/clear cannot be combined with preview
+or branch/channel overrides. Patch-stack `--check`/`--plan` are local read-only policy
+reports, not remote freshness checks or fleet inventories. The source-built
+desktop honors the policy without branch/stash overrides. This mode supports the
+main channel only and currently requires POSIX repository locking (standalone
+Windows refuses). The lock cannot exclude manual Git/editor writes; interrupted
+publication requires explicit journal recovery, never a blind reset. See
+[patch-stack setup and recovery](../getting-started/updating.md#opt-in-linear-patch-stacks-source-git-main-channel).
+A failure after publication is recorded as partial and does not roll code back.
+
+The autostash and branch-switch behavior below describes **non-patch-stack**
+source updates; it does not override an enabled policy.
 
 | Option | Description |
 |--------|-------------|
 | `--install-id` | Print this installation's identity and path, then exit. |
 | `--set-channel CHANNEL` | Persist `main`, `stable`, or `canary` for this source installation without applying an update. Bundled applications have a fixed build channel and refuse channel changes. |
 | `--channel CHANNEL` | Select a source channel for this invocation only. |
-| `--branch NAME` | Select a source branch for this invocation; takes precedence over source channel selection. |
+| `--branch NAME` | Select a source branch for this invocation; takes precedence over source channel selection. Refused while a patch-stack policy is enabled. |
+| `--set-patch-stack BRANCH --base REMOTE/main` | Configure a linear local patch stack for this source Git installation on the main channel, then exit without moving code. Both options are required together. |
+| `--clear-patch-stack` | Remove only this installation's patch-stack policy, then exit without moving code; subsequent ordinary updates may switch to main. |
 | `--gateway` | Internal mode used by the messaging `/update` command. Uses file-based IPC for prompts and progress streaming instead of reading from terminal stdin. Not a gateway restart flag. |
 | `--check` | Check whether an update is available without pulling, installing dependencies, or restarting anything. |
 | `--plan` | Print the update plan and exit without changing anything: install kind (git/Docker/Nix/apt), every running Hermes service across all profiles with its supervisor and running code version, and how each will be restarted. On image- or package-managed installs, reports the correct external update command instead. Read-only. |

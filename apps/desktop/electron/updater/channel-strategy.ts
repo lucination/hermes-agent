@@ -117,7 +117,7 @@ export class ChannelStrategy implements UpdaterStrategy {
     const strategy = this.deps.nativeFactory(target)
     const status = await strategy.check()
 
-    if (status.error || status.updateAvailable === undefined) {
+    if (status.error || status.updateAvailable === undefined || status.updateAvailable === null) {
       throw new Error(status.error || 'Native update availability unknown')
     }
 

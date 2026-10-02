@@ -266,6 +266,19 @@ def record_gateway_restart(**kwargs: Any) -> None:
     _record("gateway_restart_result", "gateway restart result", **kwargs)
 
 
+def checkpoint_update_receipt() -> None:
+    """Durably retain publication facts before fresh completion can fail or be killed."""
+    current = _current.get()
+    if current is None:
+        return
+    from hermes_cli.runtime_state import _atomic_bytes
+    directory = _receipt_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    payload = (json.dumps(current.data, indent=2, default=str) + '\n').encode('utf-8')
+    _atomic_bytes(directory / f'update_published_{current.correlation_id}.json', payload)
+    _atomic_bytes(directory / 'latest.json', payload)
+
+
 def finalize_update_receipt(outcome: str, fleet: list | None = None, stop_reason: str = "") -> Optional[Path]:
     """Finalize + persist the receipt (``success``/``partial``/``failed``/``refused``); path or None.
 
@@ -290,6 +303,8 @@ def finalize_update_receipt(outcome: str, fleet: list | None = None, stop_reason
         # pop THIS context only, so exactly-once still holds.
         _current.set(None)
     try:
+        if receipt.data.get('code_published') is True and outcome in ('failed', 'refused'):
+            outcome = 'partial'
         receipt.finalize(outcome)
         if stop_reason:
             receipt.data["stop_reason"] = stop_reason

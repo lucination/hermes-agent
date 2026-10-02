@@ -156,6 +156,107 @@ def collect_superseded_generations(project_root: Path) -> None:
 _METADATA_FLAGS = frozenset({"-h", "--help", "-V", "--version"})
 
 
+def pending_patch_stack_transaction(project_root: Path) -> Path | None:
+    """Read the repository-wide barrier without Git, policy, or PM imports.
+
+    Gitfiles and linked-worktree commondir paths are relative to their containing
+    directory. Scan all install journals: another worktree/home owns the same repo.
+    An unreadable Git pointer/barrier is not permission to repair a mixed tree.
+    """
+    gitdir = Path(project_root).resolve() / '.git'
+    try:
+        if gitdir.is_file():
+            pointer = gitdir.read_text(encoding='utf-8').strip()
+            if not pointer.startswith('gitdir: '):
+                raise ValueError('invalid Git directory pointer')
+            gitdir = (gitdir.parent / pointer[len('gitdir: '):]).resolve()
+        if not gitdir.is_dir():
+            return None
+        commondir = gitdir / 'commondir'
+        if commondir.is_file():
+            gitdir = (gitdir / commondir.read_text(encoding='utf-8').strip()).resolve()
+        directory = gitdir / 'hermes-patch-stacks'
+        if not directory.exists():
+            return None
+        return next((entry for entry in sorted(directory.iterdir()) if entry.suffix == '.json'), None)
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f'hermes: cannot inspect patch-stack pending transaction: {exc}; explicit recovery required') from exc
+
+
+def patch_stack_completion_reserved(project_root: Path) -> bool:
+    """A fully-published tree may activate, but never lazily repair its tail.
+
+    Any other/malformed journal wins over completion reservations. Reservations
+    never authorize update mutations and do not expire when an owner dies.
+    """
+    pending = pending_patch_stack_transaction(project_root)
+    if pending is None:
+        return False
+    try:
+        return all(json.loads(entry.read_text(encoding='utf-8')).get('phase') == 'completion'
+                   for entry in pending.parent.iterdir() if entry.suffix == '.json')
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def patch_stack_launch_admission(project_root: Path, argv: list[str]) -> bool:
+    """Leave policy-only commands to their owner, before legacy launch repair.
+
+    This reads configuration only; no PM activation/leases, cache, or recovery.
+    Unreadable policy must reach the CLI's explicit refusal, not legacy repair.
+    """
+    from hermes_cli._parser import command_argv
+
+    command = command_argv(argv)
+    pending = pending_patch_stack_transaction(project_root)
+    if pending is not None:
+        if command[:1] == ["update"] or patch_stack_completion_reserved(project_root):
+            return True  # Dispatch owns refusal; a fully-published tree may only activate.
+        raise SystemExit(f'hermes: patch-stack pending transaction: {pending}; explicit recovery required')
+    if command[:1] != ["update"]:
+        return False
+    options = {arg.partition("=")[0] for arg in command[1:]}
+    if options & {"--set-patch-stack", "--clear-patch-stack"}:
+        return True
+    if not options & {"--check", "--plan"}:
+        return False
+    from hermes_constants import get_process_hermes_home, get_default_hermes_root
+
+    home = get_process_hermes_home()
+    # Profile selection normally happens later in main; inspect it without
+    # modifying argv or the process home here.
+    prefix = argv[:len(argv) - len(command)]
+    profile = None
+    for index, arg in enumerate(prefix):
+        if arg in {"--profile", "-p"} and index + 1 < len(prefix):
+            profile = prefix[index + 1]
+        elif arg.startswith("--profile="):
+            profile = arg.partition("=")[2]
+    default = get_default_hermes_root()
+    if profile is None and home.parent.name != "profiles":
+        try:
+            profile = (default / "active_profile").read_text(encoding="utf-8-sig").strip()
+        except OSError:
+            pass
+    if profile:
+        import re
+        profile = profile.lower()
+        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", profile):
+            return True
+        home = default if profile == "default" else default / "profiles" / profile
+    path = home / "config.yaml"
+    if not path.exists():
+        return False
+    try:
+        import hermes_yaml
+        from hermes_cli.update_patch_stack import read_policy
+
+        config = hermes_yaml.safe_load(path.read_text(encoding="utf-8-sig")) or {}
+        return read_policy(config, project_root) is not None
+    except Exception:
+        return True  # Admission is conservative; dispatch diagnoses invalid policy.
+
+
 def completion_pending_path(project_root: Path) -> Path:
     """Marker for a source update whose dependency sync committed but whose tail
     (launchers, products, maintenance) has not finished.
@@ -352,6 +453,8 @@ def prepare_launch(project_root: Path, argv: list[str]) -> Path | None:
     import sys
 
     root = Path(project_root).resolve()
+    if patch_stack_launch_admission(root, argv):
+        return None
     # sys.argv[0] is this process's script identity; *argv* carries only the command.
     if _is_tail_script(root, sys.argv[0]):
         return None

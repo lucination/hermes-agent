@@ -531,7 +531,14 @@ from hermes_cli._parser import command_argv
 
 # Repair needs only stdlib. Do not activate the damaged tree to reach it.
 _pm_repair = command_argv(sys.argv[1:])[:2] == ["pm", "repair"]
-if not _pm_repair:
+from hermes_cli.venv_sync import patch_stack_launch_admission, patch_stack_completion_reserved
+_patch_stack_admission = patch_stack_launch_admission(_root, sys.argv[1:])
+if (_patch_stack_admission and command_argv(sys.argv[1:])[:1] != ["update"]
+        and patch_stack_completion_reserved(_root)):
+    # Completion owns all repairs, but its prepared interpreter (and restarted
+    # services) still need read-only dependency activation, especially under -S.
+    activate_dependencies(_root)
+if not _pm_repair and not _patch_stack_admission:
     from hermes_cli.venv_sync import prepare_launch, relaunch_command
 
     try:
@@ -569,4 +576,5 @@ if not _pm_repair:
             print(f"hermes: {exc}; run `hermes pm repair`", file=sys.stderr)
             raise SystemExit(1) from None
 install_happy_eyeballs_socket_connect()
-export_scratch_tmp_env()
+if not _patch_stack_admission:
+    export_scratch_tmp_env()

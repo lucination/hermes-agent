@@ -111,4 +111,29 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
         help="Update code and dependencies but defer the fleet restart. Use for updates "
              "running inside a gateway cgroup, then restart gateways separately.",
     )
+    update_parser.add_argument('--set-patch-stack', metavar='BRANCH', default=None,
+                               help='Configure this source/main install to rebase BRANCH; requires --base. Configure only.')
+    update_parser.add_argument('--base', metavar='REMOTE/main', default=None,
+                               help='Explicit base for --set-patch-stack (for example upstream/main).')
+    update_parser.add_argument('--clear-patch-stack', action='store_true', default=False,
+                               help='Disable patch-stack policy without moving code; later updates may switch to main.')
+    # Validate combinations after parsing so argument order cannot bypass the contract.
+    parse_known_args = update_parser.parse_known_args
+
+    def parse_validated(argv=None, namespace=None):
+        parsed, remaining = parse_known_args(argv, namespace)
+        setup = parsed.set_patch_stack is not None
+        clear = parsed.clear_patch_stack
+        if setup != (parsed.base is not None):
+            update_parser.error('--set-patch-stack and --base must be supplied together')
+        if setup or clear:
+            if setup and clear:
+                update_parser.error('--set-patch-stack and --clear-patch-stack are exclusive')
+            forbidden = ('check', 'plan', 'branch', 'channel', 'set_channel', 'switch_branch', 'keep_stash',
+                         'install_id', 'list_venv_holders')
+            if any(getattr(parsed, name, None) for name in forbidden):
+                update_parser.error('patch-stack configuration cannot be combined with preview/update overrides')
+        return parsed, remaining
+
+    update_parser.parse_known_args = parse_validated
     update_parser.set_defaults(func=cmd_update)

@@ -49,7 +49,16 @@ export function resolveUpdaterMechanism(facts: MechanismFacts): UpdaterMechanism
 export interface UpdaterStatusWire {
   supported: boolean
   mechanism?: UpdaterMechanism
-  updateAvailable?: boolean
+  updateAvailable?: boolean | null
+  patch_stack?: {
+    branch: string
+    base_remote: string
+    base_branch: string
+    remote_url: string
+    anchor_sha: string
+    baseSha: string | null
+    ancestry: 'unknown' | 'forward' | 'rewind'
+  }
   branch?: string
   currentBranch?: string
   reason?: string

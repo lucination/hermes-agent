@@ -13,6 +13,52 @@ import type { SourceUpdate } from './checkout-source'
 const IS_WINDOWS: boolean = process.platform === 'win32'
 const NO_GATEWAY_FLAG: string = IS_WINDOWS ? '-NoGateway' : '--no-gateway'
 
+it.each([false, true])(
+  'patch-stack handoff carries no target override on Windows=%s',
+  async (windows): Promise<void> => {
+    const { root, deps } = handoffFixture(false)
+    fs.writeFileSync(path.join(root, 'scripts', 'desktop-update', 'windows.ps1'), '')
+    const resolveHandoff = updaterProcess.resolveUpdateScriptHandoff
+    vi.spyOn(updaterProcess, 'resolveUpdateScriptHandoff').mockImplementation(updateRoot =>
+      resolveHandoff(updateRoot, { isWindows: windows })
+    )
+    deps.isWindows = windows
+    deps.readSourceUpdate = async () => ({
+      supported: true,
+      branch: 'patches',
+      patch_stack: {
+        branch: 'patches',
+        base_remote: 'upstream',
+        base_branch: 'main',
+        remote_url: 'https://example.invalid/base',
+        anchor_sha: 'a'.repeat(40),
+        baseSha: 'a'.repeat(40),
+        ancestry: 'unknown'
+      }
+    })
+    const spawned: string[][] = []
+    vi.spyOn(updaterProcess, 'spawnUpdaterProcess').mockImplementation((_command, args) => {
+      spawned.push(args)
+
+      return { unref: (): void => {} }
+    })
+
+    try {
+      expect(await createCheckoutStrategy(deps).apply()).toMatchObject({ ok: true, handedOff: true })
+      expect(spawned).toHaveLength(1)
+      expect(spawned[0]!.join(' ')).not.toMatch(/--branch|--channel|-Branch|-Channel/)
+      fs.rmSync(path.join(root, 'scripts'), { recursive: true })
+      expect(await createCheckoutStrategy(deps).apply()).toMatchObject({
+        ok: true,
+        manual: true,
+        command: 'hermes update'
+      })
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  }
+)
+
 afterEach((): void => {
   vi.restoreAllMocks()
 })

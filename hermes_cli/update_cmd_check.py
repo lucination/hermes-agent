@@ -10,7 +10,10 @@ from __future__ import annotations
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from hermes_cli.update_patch_stack import Policy
 
 
 def _git(git_cmd: list[str], root: Path, args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
@@ -28,6 +31,23 @@ def _uc():
     from hermes_cli import update_cmd
 
     return update_cmd
+
+
+def report_patch_stack(root: Path, policy: Policy) -> None:
+    """Local-only preview: no fetch, lock creation, cache writes, or debris cleanup."""
+    from hermes_cli import update_patch_stack as stack
+    observation = stack.observe(root, policy)
+    count = stack.git(root, 'rev-list', '--count', f'{observation.base}..{observation.head}').stdout.strip()
+    print(f'→ Patch stack: {policy.branch} ({count} local patches)')
+    print(f'  Source: {policy.base_remote}/{policy.base_branch} ({policy.remote_url})')
+    print(f'  Recorded base: {observation.base}')
+    print(f'  Patch head: {observation.head}')
+    print('  Remote target/ancestry: unknown; requires fetch during apply.')
+    pending = stack.journal_path(root)
+    print(f'  Candidate: pending transaction {pending}' if pending.exists() else '  Candidate: not staged')
+    decision = stack.plan(policy, observation, observation.base, forward=True)
+    if isinstance(decision, stack.Refused):
+        print(f'  Refused: {decision.reason}')
 
 
 def clear_git_debris(root: Path) -> None:

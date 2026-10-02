@@ -11,7 +11,7 @@
 # CONTRACT (keep in sync with apps/desktop/electron/main.ts):
 #   bash scripts/desktop-update/posix.sh
 #     --install-root <path>    repo checkout (HERMES_HOME/hermes-agent)
-#     [--branch <ref> | --channel stable|canary|main]  default: branch main
+#     [--branch <ref> | --channel stable|canary|main]  default: native install policy
 #     --desktop-pid <pid>      the Electron main process to wait out
 #     [--relaunch-target <p>]  mac: running .app to swap+reopen;
 #                              linux: running binary (omit = no relaunch)
@@ -37,7 +37,7 @@
 set -u
 
 ORIGINAL_ARGS=("$@")
-INSTALL_ROOT="" BRANCH="main" CHANNEL="" DESKTOP_PID=0 RELAUNCH_TARGET=""
+INSTALL_ROOT="" BRANCH="" CHANNEL="" DESKTOP_PID=0 RELAUNCH_TARGET=""
 BRANCH_EXPLICIT=0
 RELAUNCH_CWD="" SANDBOX_FALLBACK=0 RELAUNCH_ARGS=()
 NO_GATEWAY=0
@@ -72,7 +72,8 @@ while [ $# -gt 0 ]; do
 done
 [ "$SELF_TEST_UI" -eq 1 ] || [ -n "$INSTALL_ROOT" ] || { echo "--install-root is required" >&2; exit 64; }
 [ "$BRANCH_EXPLICIT" -eq 0 ] || [ -z "$CHANNEL" ] || { echo "--branch and --channel are mutually exclusive" >&2; exit 64; }
-TARGET_ARGS=(--branch "$BRANCH")
+TARGET_ARGS=()
+[ "$BRANCH_EXPLICIT" -eq 0 ] || TARGET_ARGS=(--branch "$BRANCH")
 [ -z "$CHANNEL" ] || TARGET_ARGS=(--channel "$CHANNEL")
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -827,7 +828,7 @@ export HERMES_UPDATE_STATUS_FILE="$STATUS"
 # know the flag and argparse would abort with exit 2, which collides with the
 # "close all Hermes windows" sentinel.
 KEEP_STASH=""
-if "${UPDATE_INVOKE[@]}" update --help 2>/dev/null | grep -q -- '--keep-stash'; then
+if [ "${#TARGET_ARGS[@]}" -gt 0 ] && "${UPDATE_INVOKE[@]}" update --help 2>/dev/null | grep -q -- '--keep-stash'; then
   KEEP_STASH="--keep-stash"
 else
   log "installed hermes predates --keep-stash; running without it"

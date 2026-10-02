@@ -137,12 +137,20 @@ export function createCheckoutStrategy(deps: CheckoutStrategyDeps): UpdaterStrat
     }
 
     const branch: string = status.branch ?? deps.defaultUpdateBranch
-    const targetArgs: string[] = status.channel ? ['--channel', status.channel] : ['--branch', branch]
-    const targetLabel: string = status.channel ?? branch
 
-    const manualCommand: string = status.channel
-      ? `hermes update --channel ${status.channel}`
-      : buildManualUpdateCommand(branch)
+    const targetArgs: string[] = status.patch_stack
+      ? []
+      : status.channel
+        ? ['--channel', status.channel]
+        : ['--branch', branch]
+
+    const targetLabel: string = status.patch_stack ? `patch stack ${branch}` : (status.channel ?? branch)
+
+    const manualCommand: string = status.patch_stack
+      ? 'hermes update'
+      : status.channel
+        ? `hermes update --channel ${status.channel}`
+        : buildManualUpdateCommand(branch)
 
     const updater: string | null = deps.resolveUpdaterBinary()
     const root: string = deps.resolveUpdateRoot()
@@ -164,7 +172,7 @@ export function createCheckoutStrategy(deps: CheckoutStrategyDeps): UpdaterStrat
       return { ok: true, manual: true, command, hermesRoot: root }
     }
 
-    if (!deps.isWindows && (!updater || status.channel)) {
+    if (!deps.isWindows && (!updater || status.channel || status.patch_stack)) {
       // macOS/Linux: hand off to the repo-owned posix script — same shape as
       // Windows (quit → detached orchestrator → `hermes update` → relaunch),
       // minus the venv-lock gauntlet POSIX doesn't need. The old in-app
@@ -177,7 +185,7 @@ export function createCheckoutStrategy(deps: CheckoutStrategyDeps): UpdaterStrat
       return await applyPosixHandoff(targetArgs, targetLabel, manualCommand)
     }
 
-    if (!updater || status.channel) {
+    if (!updater || status.channel || status.patch_stack) {
       // No staged updater binary — this is a CLI-installed user (they ran
       // `hermes desktop`, never the Tauri installer that self-copies
       // hermes-setup.exe into HERMES_HOME). On Windows the repo hand-off
@@ -277,7 +285,7 @@ export function createCheckoutStrategy(deps: CheckoutStrategyDeps): UpdaterStrat
       const wrappedArgs: string[] = [
         '-InstallRoot',
         updateRoot,
-        ...(status.channel ? ['-Channel', status.channel] : ['-Branch', branch]),
+        ...(status.patch_stack ? [] : status.channel ? ['-Channel', status.channel] : ['-Branch', branch]),
         '-DesktopPid',
         String(process.pid),
         '-RelaunchExe',

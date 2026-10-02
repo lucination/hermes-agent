@@ -20,7 +20,7 @@
 #   cmd /d /s /c start "" /b powershell -NoProfile -ExecutionPolicy Bypass
 #     -File scripts\desktop-update\windows.ps1
 #     -InstallRoot <path>   repo checkout (HERMES_HOME\hermes-agent)
-#     [-Branch <ref> | -Channel stable|canary|main]  default: branch main
+#     [-Branch <ref> | -Channel stable|canary|main]  default: native install policy
 #     -DesktopPid <pid>     the Electron main process to wait out
 #     [-RelaunchExe <path>] Hermes.exe to start when done (omit = no relaunch)
 #     [-NoUi]               headless (tests); default shows a progress window
@@ -43,7 +43,7 @@
 
 param(
     [string]$InstallRoot,
-    [string]$Branch = "main",
+    [string]$Branch = "",
     [ValidateSet("stable", "canary", "main")]
     [string]$Channel,
     [int]$DesktopPid = 0,
@@ -60,7 +60,9 @@ param(
 if ($PSBoundParameters.ContainsKey("Branch") -and $PSBoundParameters.ContainsKey("Channel")) {
     throw "-Branch and -Channel are mutually exclusive"
 }
-$targetArgs = if ($Channel) { @("--channel", $Channel.ToLowerInvariant()) } else { @("--branch", $Branch) }
+$targetArgs = @()
+if ($Channel) { $targetArgs = @("--channel", $Channel.ToLowerInvariant()) }
+elseif ($PSBoundParameters.ContainsKey("Branch")) { $targetArgs = @("--branch", $Branch) }
 
 if (-not $SelfTestUi -and -not $SelfTestPipeDrain -and -not $InstallRoot) {
     # Mandatory in spirit; relaxed in the signature only so the self-test
@@ -1646,7 +1648,7 @@ try {
     # collides with the "close all Hermes windows" sentinel.
     try {
         $updateHelp = & $pythonExe @runtimeArgs update --help 2>$null | Out-String
-        if ($updateHelp -match "--keep-stash") {
+        if ($targetArgs.Count -gt 0 -and $updateHelp -match "--keep-stash") {
             $updateArgs += "--keep-stash"
         } else {
             Write-HandoffLog "installed hermes predates --keep-stash; running without it"

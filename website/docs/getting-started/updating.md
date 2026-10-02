@@ -119,6 +119,151 @@ Back up data before changing release channels.
 `hermes update` automatically detects new configuration options and prompts you to add them. If you skipped that prompt, you can manually run `hermes config check` to see missing options, then `hermes config migrate` to interactively add them.
 :::
 
+### Opt-in linear patch stacks (source Git, main channel)
+
+For a source installation that carries committed local changes on a named branch,
+use an explicit per-install patch-stack policy instead of the legacy parked-branch
+merge strategy:
+
+```bash
+# In the source checkout; upstream must already name the intended repository.
+git remote -v
+git fetch --no-tags upstream main
+git checkout lucination
+git status --short                  # commit/preserve local work first
+hermes update --set-patch-stack lucination --base upstream/main
+hermes update --check
+hermes update --plan
+hermes update --yes
+# Disable the policy for THIS installation without moving code:
+hermes update --clear-patch-stack
+```
+
+Setup records the branch, remote name and URL, a verified merge-base SHA, and a
+private Git base ref. The configuration is under
+`update.installs.<install-id>.patch_stack` (fields `branch`, `base_remote`,
+`base_branch`, `remote_url`, `anchor_sha`); use the setup/clear commands rather
+than editing these fields. Setup and clear do not apply an update. Clearing does
+not delete your branch; the next ordinary update can switch to `main` again.
+
+Only source Git installations on the `main` channel and a `REMOTE/main` base
+are supported. Bundled applications and package/image-managed installs do not
+use this mode. Standalone Windows refuses because the repository lock currently
+requires POSIX `flock`; do not bypass locking. Setup uses the same managed-install
+admission as update **before** creating lock metadata, a journal, refs, or policy.
+Clear is metadata-only recovery: it may remove a saved policy even if the install
+has since become package/image-managed, but it refuses any pending repository
+transaction and never grants permission to update managed code. An enabled policy rejects
+`--branch`, `--channel`, `--set-channel`, `--switch-branch`, and `--keep-stash`.
+Clear the policy explicitly before selecting those behaviors.
+
+A real update fetches the configured upstream and rebases the linear local stack
+in a detached candidate worktree. Upstream-equivalent patches can be dropped;
+other empty patches, conflicts, or invalid startup/update modules stop before
+publication. A dirty or untracked checkout, hidden index flags, an active Git
+operation, shallow/merge-containing ancestry, a changed remote, or an upstream
+rewind/divergence also refuses. There is no autostash, merge, ZIP fallback,
+automatic hard reset, or automatic push. `--check` and `--plan` report the recorded
+policy and locally known base without fetching or running completion; they do
+not establish that remote `main` is unchanged.
+
+After candidate validation, the patch branch and private base ref are published
+in one Git ref transaction, then the checkout files are updated. Dependency,
+config, desktop, and restart completion uses the published **patch head**, not
+the upstream SHA. A post-publication failure is a **partial** update, not a code
+rollback. Inspect the receipt and pending-completion diagnostics before retrying.
+The source-built desktop must use the same policy without adding branch or stash
+overrides.
+
+:::warning Concurrency and recovery limits
+The repository-wide lock serializes cooperating Hermes patch-stack operations
+across worktrees and homes. It does **not** prevent manual Git commands, editors,
+or other tools from changing the checkout. Keep those writers stopped during an
+update. Ref publication and filesystem publication are separate operations;
+a crash or concurrent writer can leave a pending journal and mixed files.
+Do not treat this mode as a fully atomic checkout swap or a substitute for backups.
+:::
+
+#### Pending patch-stack transaction: inspect and preserve first
+
+Once detached staging has begun, a failed stage or publication retains the
+candidate (when created), recovery refs, and a JSON journal under the repository's
+**common Git directory**, in
+`hermes-patch-stacks/`. Subsequent patch-stack operations refuse until explicit
+recovery. Neither clear nor retry silently discards that evidence.
+
+Successful publication retains an `applied` journal while preparing the completion
+request and checkpointing the receipt. It is durably replaced with a `completion`
+reservation, **without deleting the barrier between phases**, and removed only
+after successful fresh completion. Even an already-current/no-op update reserves
+its completion before those post-apply steps. A completion reservation preserves
+candidate/recovery fields when present; a no-op has no detached candidate.
+While `applied` is pending, ordinary launches from any home refuse before legacy
+repair or dependency activation. A fully published `completion` reservation
+allows the fresh worker and restarted runtimes to activate selected dependencies,
+but never permits lazy repair or another update.
+
+Reservations have **no timeout**. The updater's death releases its OS lock, not
+the durable lifecycle barrier; it does not prove that its fresh completion child,
+PM worker, build subprocesses, or service-restart activity have stopped. A pending
+`completion` phase can represent a coherent code checkout with an unfinished
+dependency/build/restart tail, not merely a stale lock to remove.
+
+1. Stop further updates and any editors/Git writers for this repository. Establish
+   quiescence across **all homes/worktrees**: wait for or stop the updater and any
+   orphaned completion children, PM workers, build tools, and service-manager
+   restart jobs. Check process trees and service state; a dead owner PID or an
+   available repository lock is insufficient. Do not archive/remove the journal
+   until those actors can no longer mutate code, dependencies, or runtime state.
+   Do not restart services on an unverified mixed checkout.
+2. From the checkout, locate the journal and inspect live state:
+
+   ```bash
+   git rev-parse --path-format=absolute --git-common-dir
+   git status --short
+   git branch --show-current
+   git rev-parse HEAD
+   git for-each-ref refs/hermes-patch-stacks/
+   # Read the exact journal path printed by the refusal:
+   python -m json.tool /absolute/path/to/hermes-patch-stacks/INSTALL_ID.json
+   ```
+
+3. Preserve evidence **outside** the checkout before editing it. Use your own
+   new backup directory; do not overwrite an earlier backup:
+
+   ```bash
+   git bundle create /safe/new-backup/repository.bundle --all
+   git diff --binary > /safe/new-backup/live-working.patch
+   git diff --cached --binary > /safe/new-backup/live-index.patch
+   # Copy the journal and any untracked files separately. A bundle does not
+   # contain working-tree changes, ignored files, or profile/credential data.
+   ```
+
+   Inspect the journal's `candidate` path with `git -C /exact/candidate status`
+   and preserve its working/index diffs and untracked files in the same way.
+4. Compare journal `original`, `base`, `target`, `head`, `branch`, and `phase`
+   with the live refs and candidate. For a **prepublication conflict** with live
+   branch/base still exactly at `original`/`base`, you may abandon the staged
+   attempt after preserving your edits: run `git -C /exact/candidate rebase --abort`,
+   then `git worktree remove /exact/candidate`. Only after verifying the live
+   refs and clean checkout again, move the exact journal into the backup
+   directory and retry. If rebase abort or worktree removal refuses, stop;
+   do not add `--force`. Resolving the candidate manually does not make the
+   old staged journal valid for automatic publication.
+5. For `configuring`, `publishing-refs`, `publishing-files`, `applied`, `completion`,
+   unknown phases, changed live refs, or a dirty/mixed checkout, there is no
+   universal safe reset command. Keep the journal and recovery refs, preserve
+   all edits, and reconcile the selected branch, private base ref, index, and
+   files together with a maintainer. For completion phases, also inspect the
+   correlated update receipt, PM selection/facts, built products, and restart
+   obligations against the journal's patch `head`. Do not delete the journal
+   to bypass the barrier, blindly `reset --hard`, or rerun the installer.
+   After quiescence and evidence backup, an operator may archive/remove the exact
+   journal only as part of a controlled recovery that reconciles the code and
+   dependency/build/restart tail. Do not start a competing completion or allow
+   ordinary launches until that recovery has selected coherent code/dependencies;
+   restart and verify the services you own before declaring recovery complete.
+
 ### Passive update notices
 
 Pinned or noninteractive installations can disable passive CLI version and banner update checks:
@@ -131,7 +276,9 @@ This suppresses both cached update notices and passive update-check network requ
 
 ### What happens during an update
 
-For an admitted source checkout, `hermes update` runs these phases:
+For an admitted source checkout without an enabled patch-stack policy,
+`hermes update` runs these phases. Patch-stack mode replaces the code-pull and
+automatic rollback phases with the candidate/publication flow described above:
 
 1. **Pre-update snapshot** — Hermes saves selected state files for every profile in that profile's `state-snapshots/` directory. These include pairing data, cron jobs, `config.yaml`, `.env`, and `auth.json`. Automatic quick snapshots skip individual files larger than 1 GiB. `updates.pre_update_backup` selects `quick`, `full`, or `off`. Full archives use the [backup exclusions](../reference/faq.md#hermes-backup-vs-hermes-profile-export). Recovery uses [Snapshots and rollback](../user-guide/checkpoints-and-rollback.md). Quick snapshots recover state files, not application code. The snapshot is best-effort: if it fails, the update prints a `⚠ Pre-update snapshot FAILED` warning and continues, and the receipt records `pre_update_backup` as a failed step (a deliberate `off`/`--no-backup` lands in the receipt's skips with its reason instead).
 2. **Code update** — applies the configured source branch or stable release tag and updates submodules.

@@ -206,14 +206,16 @@ def _read_json(path: Path):
 
 def _unsupported_reason(stamp: dict, root: Path, *, explicit_root: bool, embedded: Optional[str]) -> Optional[dict]:
     """Fields explaining why this install cannot self-update from Git, or None when it can."""
-    from hermes_cli.config import detect_install_method
     from hermes_cli.update_contract import COMMIT_BUILD_UPDATE_MESSAGE
 
     if stamp.get("source") == "commit-build":
         return {"reason": "commit-build", "message": COMMIT_BUILD_UPDATE_MESSAGE}
-    if stamp.get("payload") in {"bundled", "light", "runtime"} or (
-            not explicit_root and detect_install_method(root) in {"docker", "apt"}):
+    if stamp.get("payload") in {"bundled", "light", "runtime"}:
         return {"reason": "not-a-git-checkout"}
+    if not explicit_root:
+        from hermes_cli.config import detect_install_method
+        if detect_install_method(root) in {"docker", "apt"}:
+            return {"reason": "not-a-git-checkout"}
     if not embedded and not (root / ".git").exists():
         return {"reason": "not-a-git-checkout", "message": "This install has no git checkout to update."}
     if stamp.get("updateMechanism") not in (None, "self") and not embedded:
@@ -370,6 +372,45 @@ def _check_branch(result: dict, co: _Checkout, selected_branch: str, *,
     result.update(targetSha=target, behind=behind, updateAvailable=behind != 0)
 
 
+def _check_patch_stack(result: dict, co: _Checkout, policy) -> dict:
+    """Advertise the recorded base without fetching missing ancestry or caching."""
+    from dataclasses import asdict
+    from hermes_cli.update_patch_stack import base_ref
+
+    base = _git_stdout(["rev-parse", "--verify", base_ref(co.root) + "^{commit}"], cwd=co.root, git=co.git)
+    metadata = {**asdict(policy), "baseSha": base, "ancestry": "unknown"}
+    result.update(supported=True, currentSha=co.head, currentBranch=co.current_branch,
+                  dirty=co.dirty, branch=policy.branch, patch_stack=metadata,
+                  updateAvailable=None, fetchedAt=int(time.time() * 1000))
+    remote_url = _git_stdout(["remote", "get-url", policy.base_remote], cwd=co.root, git=co.git)
+    if remote_url != policy.remote_url:
+        result.update(error="patch-stack-remote-changed", message="Configured base remote changed; reconfigure explicitly.")
+        return result
+    target, missing, failure = _branch_tip(None, policy.base_branch, co.root, co.git, policy.base_remote)
+    if target is None:
+        result.update(error="fetch-failed", message=failure or "Configured base branch is not advertised.")
+        return result
+    result["targetSha"] = target
+    if not base:
+        result["message"] = "Recorded base unavailable; ancestry is unknown."
+        return result
+    shallow = _git_stdout(["rev-parse", "--is-shallow-repository"], cwd=co.root, git=co.git)
+    if shallow != "false":
+        result["message"] = "Shallow or unavailable ancestry; no fetch was performed."
+        return result
+    ancestry = _git_run(["merge-base", "--is-ancestor", base, target], cwd=co.root, git=co.git)
+    if ancestry is None or ancestry.returncode not in (0, 1):
+        result["message"] = "Remote target ancestry is unknown locally; no fetch was performed."
+        return result
+    metadata["ancestry"] = "forward" if ancestry.returncode == 0 else "rewind"
+    if ancestry.returncode == 1:
+        result.update(error="patch-stack-diverged", message="Base rewound or diverged; reconfigure explicitly.")
+        return result
+    count = _git_stdout(["rev-list", "--count", f"{base}..{target}"], cwd=co.root, git=co.git)
+    result.update(behind=_quiet(lambda: int(count or "")), updateAvailable=base != target)
+    return result
+
+
 def check_for_updates(*, install_root: Path | None = None, home: Path | None = None,
                       branch: str | None = None, channel: str | None = None,
                       cache_path: Path | None = None, branch_config_path: Path | None = None,
@@ -380,20 +421,32 @@ def check_for_updates(*, install_root: Path | None = None, home: Path | None = N
     Only the default (running installation) may use HERMES_REVISION. An explicit
     target must never inherit the host process's embedded revision or stamp.
     """
-    from hermes_cli.config import get_project_root, require_readable_config_before_write
     from hermes_cli.steward import read_install_stamp
     from hermes_cli.update_channel import install_id, resolve_update_channel
     from hermes_cli.release_channels import validate_name
 
     embedded = (os.environ.get("HERMES_REVISION") or None) if install_root is None else None
-    root = Path(install_root if install_root is not None else get_project_root()).resolve()
+    root = Path(install_root if install_root is not None else Path(__file__).resolve().parents[1]).resolve()
     home = Path(home if home is not None else get_hermes_home()).resolve()
     result = {"supported": False, "hermesRoot": str(root), "behind": None, "commits": []}
     unsupported = _unsupported_reason(read_install_stamp(root), root,
                                       explicit_root=install_root is not None, embedded=embedded)
     if unsupported:
         return {**result, **unsupported}
-    config = require_readable_config_before_write(home / "config.yaml")
+    import hermes_yaml
+    from hermes_cli.update_patch_stack import read_policy
+    config_path = home / "config.yaml"
+    try:
+        config = hermes_yaml.safe_load(config_path.read_text(encoding="utf-8-sig")) if config_path.exists() else {}
+        policy = read_policy(config or {}, root)
+    except (ValueError, OSError, hermes_yaml.YAMLError) as exc:
+        return {**result, "error": "patch-stack-policy-invalid", "message": str(exc)}
+    if policy is not None and not embedded:
+        if passive and (config.get("updates") or {}).get("check") is False:
+            return {**result, "reason": "disabled"}
+        return _check_patch_stack(result, _read_checkout(root, git, embedded), policy)
+    from hermes_cli.config import require_readable_config_before_write
+    config = require_readable_config_before_write(config_path)
     if passive and (config.get("updates") or {}).get("check") is False:
         return {**result, "reason": "disabled"}
     channel = resolve_update_channel(config, root) if channel is None else validate_name(channel)
