@@ -302,16 +302,22 @@ def _require_own_dependencies(project_root: Path) -> None:
         raise RuntimeError("no dependency environment is committed for this install")
 
 
-def activate_dependencies(project_root: Path) -> None:
+def activate_dependencies(project_root: Path, *, read_only: bool = False) -> None:
     """Select the committed tree at process boot, before third-party imports.
 
     A process with no extension selection keeps its original launch contract.
     Already-running processes are never switched after a dependency install.
+    Read-only admission observes the selection without locks, recovery, or leases.
     """
     import sys
 
     state = install_state_dir(project_root)
-    if state.is_dir():
+    if read_only:
+        environment = committed_venv(project_root)
+        if environment is None:
+            return _require_own_dependencies(project_root)
+        selected = site_packages(environment)
+    elif state.is_dir():
         from hermes_cli.runtime_state import runtime_lock, recover_publication, lease_generation
         # The lock's holder may be another profile's backend running a full dependency rebuild;
         # this process only reads the committed selection, so it proceeds without waiting rather
