@@ -14,6 +14,7 @@ import re
 import time
 import weakref
 from contextlib import suppress
+from dataclasses import dataclass
 from difflib import SequenceMatcher
 from types import SimpleNamespace
 from typing import Dict, List, Optional
@@ -29,6 +30,41 @@ logger = logging.getLogger("gateway.run")  # log-record parity with the origin m
 # Adapter-side per-chat auto-TTS override sets (``/voice off`` vs explicit ``/voice on``/``tts``).
 _OFF_SET, _ON_SET = "_auto_tts_disabled_chats", "_auto_tts_enabled_chats"
 _VOICE_MODES = {"off", "voice_only", "all"}
+
+
+@dataclass(frozen=True)
+class _DiscordAutoJoinPins:
+    guild_id: int
+    user_id: int
+    text_channel_id: int
+    text_parent_id: Optional[int]
+    voice_channel_id: Optional[int]
+    voice_channel_name: str
+
+    @classmethod
+    def parse(cls, value):
+        allowed = {"enabled", "guild_id", "user_id", "text_channel_id", "text_parent_id",
+                   "voice_channel_id", "voice_channel_name"}
+        if not isinstance(value, dict) or value.get("enabled") is not True or set(value) - allowed:
+            return None
+        def snowflake(key, optional=False):
+            raw = value.get(key)
+            if key not in value and optional:
+                return None
+            if type(raw) not in (int, str) or not re.fullmatch(r"[1-9][0-9]*", str(raw)):
+                raise ValueError(key)
+            number = int(raw)
+            if number >= 2**64:
+                raise ValueError(key)
+            return number
+        try:
+            name = value.get("voice_channel_name", "General")
+            if not isinstance(name, str) or not name.strip():
+                return None
+            return cls(snowflake("guild_id"), snowflake("user_id"), snowflake("text_channel_id"),
+                       snowflake("text_parent_id", True), snowflake("voice_channel_id", True), name)
+        except (ValueError, TypeError):
+            return None
 
 
 class GatewayVoiceMixin:
@@ -145,14 +181,100 @@ class GatewayVoiceMixin:
             return int(raw.guild_id)
         return raw.guild.id if getattr(raw, "guild", None) else None  # regular message
 
+    async def _handle_discord_voice_state_update(self, adapter, member, before, after) -> None:
+        """Opt-in event-only voice attendance, using the normal speech lifecycle."""
+        pins = _DiscordAutoJoinPins.parse(adapter.config.extra.get("auto_join"))
+        if pins is None or member.guild.id != pins.guild_id or member.id != pins.user_id:
+            return
+        guild_id = pins.guild_id
+        guild = adapter._client.get_guild(guild_id)
+        if guild is None:
+            return
+        channels = [c for c in guild.voice_channels if c.name == pins.voice_channel_name]
+        if len(channels) != 1:
+            return
+        channel = channels[0]
+        if pins.voice_channel_id is not None and channel.id != pins.voice_channel_id:
+            return
+        text = adapter._client.get_channel(pins.text_channel_id)
+        if text is None or getattr(getattr(text, "guild", None), "id", None) != guild_id:
+            return
+        parent_id = getattr(text, "parent_id", None)
+        if parent_id != pins.text_parent_id:
+            return
+        if parent_id is not None:
+            parent = adapter._client.get_channel(parent_id)
+            if parent is None or getattr(getattr(parent, "guild", None), "id", None) != guild_id:
+                return
+        source = SessionSource(
+            platform=Platform.DISCORD, chat_id=str(text.id), user_id=str(member.id),
+            chat_type="thread" if parent_id else "channel",
+            thread_id=str(text.id) if parent_id else None,
+            parent_chat_id=str(parent_id) if parent_id else None,
+            guild_id=str(guild_id), profile=getattr(adapter, "_owner_profile", None))
+        source._transport_adapter_ref = weakref.ref(adapter)
+        if self._canonicalize(source, transport_profile=getattr(adapter, "_owner_profile", None)) is None:
+            return
+        if not self._is_user_authorized_for_source(source):
+            return
+        event = MessageEvent(source=source, text="", raw_message=SimpleNamespace(guild_id=guild_id))
+        before_id = getattr(before.channel, "id", None)
+        after_id = getattr(after.channel, "id", None)
+        if before_id == after_id:
+            return
+        if not hasattr(adapter, "_voice_auto_join_present"):
+            adapter._voice_auto_join_present = {}
+            adapter._voice_auto_join_owned = {}
+        present = after_id == channel.id
+        previous = adapter._voice_auto_join_present.get(guild_id, before_id == channel.id)
+        adapter._voice_auto_join_present[guild_id] = present
+        def current_channel_id():
+            current = guild.get_member(pins.user_id)
+            return getattr(getattr(getattr(current, "voice", None), "channel", None), "id", None)
+
+        async with self._voice_lifecycle_lock(adapter, guild_id):
+            # Cache and ownership may have changed while another join/leave held the lock.
+            if present and not previous and current_channel_id() == channel.id:
+                if adapter.is_in_voice_channel(guild_id):
+                    return  # Never move, claim or rebind an existing manual connection.
+                await self._join_voice_channel_unlocked(event, adapter, voice_channel=channel)
+                owned = adapter._voice_clients.get(guild_id)
+                if owned is not None and adapter.is_in_voice_channel(guild_id):
+                    adapter._voice_auto_join_owned[guild_id] = owned
+                    if current_channel_id() != channel.id:
+                        adapter._voice_auto_join_owned.pop(guild_id, None)
+                        await self._leave_voice_channel_unlocked(event, adapter)
+            elif not present:
+                owned = adapter._voice_auto_join_owned.pop(guild_id, None)
+                if (owned is not None and owned is adapter._voice_clients.get(guild_id)
+                        and getattr(owned.channel, "id", None) == channel.id):
+                    await self._leave_voice_channel_unlocked(event, adapter)
+
+    @staticmethod
+    def _voice_lifecycle_lock(adapter, guild_id):
+        """Runner transaction lock, separate from the adapter's transport IO lock."""
+        if adapter is None:
+            return asyncio.Lock()  # Unsupported commands still return their normal explanation.
+        if not isinstance(getattr(adapter, "_voice_lifecycle_locks", None), dict):
+            adapter._voice_lifecycle_locks = {}
+        return adapter._voice_lifecycle_locks.setdefault(guild_id, asyncio.Lock())
+
     async def _handle_voice_channel_join(self, event: MessageEvent) -> str:
         adapter = self._delivery_adapter_for(event.source)
+        guild_id = self._get_guild_id(event)
+        async with self._voice_lifecycle_lock(adapter, guild_id):
+            if isinstance(owned := getattr(adapter, "_voice_auto_join_owned", None), dict):
+                owned.pop(guild_id, None)  # Explicit manual control supersedes auto ownership.
+            return await self._join_voice_channel_unlocked(event, adapter)
+
+    async def _join_voice_channel_unlocked(self, event, adapter, *, voice_channel=None) -> str:
         if not hasattr(adapter, "join_voice_channel"):
             return t("gateway.voice.channel_unsupported")
         guild_id = self._get_guild_id(event)
         if not guild_id:
             return t("gateway.voice.channel_guild_only")
-        voice_channel = await adapter.get_user_voice_channel(guild_id, event.source.user_id)
+        if voice_channel is None:
+            voice_channel = await adapter.get_user_voice_channel(guild_id, event.source.user_id)
         if not voice_channel:
             return t("gateway.voice.channel_not_in_voice")
         # Wire callbacks BEFORE join so voice input arriving right after connection is not lost.
@@ -192,6 +314,13 @@ class GatewayVoiceMixin:
 
     async def _handle_voice_channel_leave(self, event: MessageEvent) -> str:
         adapter = self._delivery_adapter_for(event.source)
+        guild_id = self._get_guild_id(event)
+        async with self._voice_lifecycle_lock(adapter, guild_id):
+            if isinstance(owned := getattr(adapter, "_voice_auto_join_owned", None), dict):
+                owned.pop(guild_id, None)
+            return await self._leave_voice_channel_unlocked(event, adapter)
+
+    async def _leave_voice_channel_unlocked(self, event, adapter) -> str:
         guild_id = self._get_guild_id(event)
         if not (guild_id and hasattr(adapter, "leave_voice_channel")
                 and hasattr(adapter, "is_in_voice_channel")

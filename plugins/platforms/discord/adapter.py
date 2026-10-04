@@ -1600,6 +1600,7 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
             @self._client.event
             async def on_voice_state_update(member, before, after):
                 """Track voice channel join/leave events."""
+                await adapter_self._on_voice_state_update(member, before, after)
                 bot_guild_ids = set(adapter_self._voice_clients.keys())
                 if not bot_guild_ids:
                     return
@@ -3830,6 +3831,11 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         """True when a continuous mixer is installed for this guild."""
         mixers = getattr(self, "_voice_mixers", None)
         return bool(mixers) and mixers.get(guild_id) is not None
+
+    async def _on_voice_state_update(self, member, before, after) -> None:
+        # gateway_runner is assigned before connect(), including cold-start events.
+        if self.gateway_runner is not None:
+            await self.gateway_runner._handle_discord_voice_state_update(self, member, before, after)
 
     async def join_voice_channel(self, channel, *, text_channel_id: int = None, source: dict = None) -> bool:
         """Join a voice channel; returns True on success. ``text_channel_id`` stores the
