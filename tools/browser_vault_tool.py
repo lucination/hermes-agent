@@ -14,7 +14,7 @@ tools):
   resolved locally, the page origin must EXACTLY match the item's bound
   origin (pre-checked AND re-asserted synchronously inside the fill script),
   the field is chosen by the ported login-control classifier, injection runs
-  exclusively over the supervisor CDP WebSocket (never argv), and the tool
+  over server-side CDP WebSocket or the Camofox HTTP body (never argv), and the tool
   result reports only ``{filled_fields, kind, origin, success}`` — the
   password never appears in tool results, logs, or the session DB, and its
   exact bytes are registered with the browser-result redaction boundary so
@@ -61,6 +61,10 @@ def _eval_js(task_id: str, expression: str) -> Dict[str, Any]:
     embed secret values — the fallback places the expression in subprocess
     argv. Use :func:`_eval_js_secret` for secret-bearing expressions.
     """
+    from tools.browser_camofox import is_camofox_mode
+
+    if is_camofox_mode():
+        return _eval_camofox(task_id, expression)
     try:
         from tools.browser_supervisor import SUPERVISOR_REGISTRY
 
@@ -116,22 +120,45 @@ def _ensure_supervisor(task_id: str):
         return None
 
 
+def _eval_camofox(task_id: str, expression: str) -> Dict[str, Any]:
+    """Server-side evaluate on the task's Camofox tab, including secret-bearing JS.
+
+    Use the authenticated HTTP body, never CLI argv or the model-facing eval
+    wrapper (which redacts inspection metadata). Do not surface provider errors:
+    an evaluate server can echo the expression containing the credential.
+    """
+    from tools.browser_camofox import _ensure_tab, _post
+
+    try:
+        tab = _ensure_tab(task_id)
+        response = _post(f"/tabs/{tab['tab_id']}/evaluate",
+                         {"expression": expression, "userId": tab["user_id"]})
+        if not isinstance(response, dict) or "result" not in response or response.get("error"):
+            return {"success": False, "error_type": "eval_failed", "error": "Camofox evaluation failed."}
+        return {"success": True, "result": response["result"]}
+    except Exception:  # health: allow BLE001 -- provider exceptions may embed credentials; never log or surface them
+        return {"success": False, "error_type": "eval_failed", "error": "Camofox evaluation unavailable."}
+
+
 def _eval_js_secret(task_id: str, expression: str) -> Dict[str, Any]:
-    """Evaluate a SECRET-BEARING JS expression. Supervisor CDP-WS only.
+    """Evaluate SECRET-BEARING JS over server-side CDP-WS or Camofox HTTP body.
 
     Fails closed: there is deliberately NO fallback to the agent-browser CLI
     ``eval`` path, because that places the expression — and therefore the
     credential bytes — in subprocess argv, visible to any process listing.
-    When no supervisor session is available the caller gets a typed refusal
+    Outside Camofox, no supervisor session means a typed refusal
     (``error_type='supervisor_required'``) and nothing is written.
     """
+    from tools.browser_camofox import is_camofox_mode
+
+    camofox = is_camofox_mode()
     try:
-        supervisor = _ensure_supervisor(task_id)
+        supervisor = None if camofox else _ensure_supervisor(task_id)
     except Exception as exc:
         logger.debug("vault fill: supervisor unavailable (%s)", exc)
         supervisor = None
 
-    if supervisor is None:
+    if supervisor is None and not camofox:
         return {
             "success": False,
             "error_type": "supervisor_required",
@@ -155,6 +182,8 @@ def _eval_js_secret(task_id: str, expression: str) -> Dict[str, Any]:
         except _bd_lease.HumanHasControl as exc:
             return {"success": False, "error_type": "human_has_control", "error": str(exc)}
 
+    if camofox:
+        return _eval_camofox(task_id, expression)
     sup = supervisor.evaluate_runtime(expression)
     if sup.get("ok"):
         return {"success": True, "result": sup.get("result")}
@@ -203,6 +232,11 @@ def _focus_bound_origin(task_id: str, origin: str, kind: str) -> Optional[str]:
     """Point the supervisor's page session at the open tab on ``origin`` that holds a ``kind`` form
     (browser_exec sessions open their own tabs, so the tab the supervisor attached to first is rarely the
     login page). Returns the origin when a tab was focused, else None (caller falls back to the current page)."""
+    from tools.browser_camofox import is_camofox_mode
+
+    # Camofox owns exactly the current task tab; never select another browser's tab.
+    if is_camofox_mode():
+        return None
     try:
         supervisor = _ensure_supervisor(task_id)
     except Exception:
