@@ -28,7 +28,6 @@ async def restore_heartbeat_watches(runner) -> None:
     """
     from gateway.run import _profile_runtime_scope
     from gateway.run_idle_gates import profile_has_active_heartbeat
-    from hermes_cli.heartbeat import HeartbeatManager
     from hermes_constants import get_hermes_home
 
     store = runner.session_store
@@ -61,7 +60,7 @@ async def restore_heartbeat_watches(runner) -> None:
                     with runner._profile_scope_for_source(group[0][1]):
                         for entry, source in group:
                             try:
-                                if HeartbeatManager(entry.session_id).is_active():
+                                if runner._heartbeat_manager_for_route(source, entry.session_key, entry.session_id).is_active():
                                     restored.append((entry.session_key, source, entry.session_id))
                             except Exception:
                                 logger.debug("heartbeat restore for %s failed", entry.session_key, exc_info=True)

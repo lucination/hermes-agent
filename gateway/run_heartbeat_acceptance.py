@@ -10,12 +10,12 @@ logger = logging.getLogger("gateway.run")
 
 
 async def resolve_heartbeat_owner(runner, event, entry):
-    """Keep normal reset/topic resolution, then admit only the original lineage."""
+    """Keep normal resolution; session scope follows lineage, channel scope follows the exact route."""
     expected = getattr(event, "_heartbeat_session_id", None)
     if not expected:
         return True
     resolved = entry.session_id
-    if resolved != expected:
+    if resolved != expected and getattr(event, "_heartbeat_channel_route", None) is None:
         def compression_tip():
             return runner.session_store._db_for_key(entry.session_key).get_compression_tip(expected)
 
@@ -33,7 +33,19 @@ def heartbeat_owner_is_current(runner, event, session_key):
     if not expected:
         return True
     current = runner.session_store.lookup_by_session_key(session_key)
-    return current is not None and not current.suspended and current.session_id == expected
+    if current is None or current.suspended or current.session_id != expected:
+        return False
+    route = getattr(event, "_heartbeat_channel_route", None)
+    if route is not None:
+        try:
+            source = runner._restored_source(current)
+            manager = runner._channel_heartbeat_manager(source, session_key)
+            return (manager.route == route
+                    and manager.owns_claim(getattr(event, "_heartbeat_channel_claim", None)))
+        except Exception:
+            logger.debug("channel heartbeat owner unresolved", exc_info=True)
+            return False
+    return True
 
 
 def settle_heartbeat_attempt(event, manager):

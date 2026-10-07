@@ -1,7 +1,8 @@
-"""Session heartbeats — recurring re-entry prompts for the current session.
+"""Heartbeats — session re-entry prompts, with opt-in durable gateway channel ownership.
 
-Session-scoped and in-process (CLI or gateway must be running); durable cross-process scheduling stays
-``hermes cron``. Invariants (mirrors goals.py): injection is a plain user message — no system-prompt
+Legacy scope is the session; channel scope follows the current routed conversation indefinitely.
+The CLI or gateway must be running; isolated scheduled jobs stay ``hermes cron``.
+Invariants (mirrors goals.py): injection is a plain user message — no system-prompt
 mutation or toolset swap, so prompt caching stays intact — and a real user message always wins:
 heartbeats only fire into an idle session with an empty input queue."""
 
@@ -11,6 +12,7 @@ import json
 import logging
 import re
 import time
+import uuid
 from dataclasses import asdict, dataclass
 from typing import Any, Optional
 
@@ -125,7 +127,9 @@ def store_has_active_heartbeat(db: Any) -> bool:
     so key existence alone is not "active". Read errors propagate: "unavailable" is the caller's call."""
     for _key, raw in db.list_meta_prefix(_META_PREFIX):
         try:
-            if HeartbeatState.from_json(raw).status == "active":
+            data = json.loads(raw)
+            state = data["state"] if _key.startswith("heartbeat:channel:") else data
+            if HeartbeatState.from_json(json.dumps(state)).status == "active":
                 return True
         except Exception:
             return True
@@ -144,6 +148,48 @@ def save_heartbeat(session_id: str, state: HeartbeatState) -> None:
         db.set_meta(_META_PREFIX + session_id, state.to_json())
     except Exception as exc:
         logger.debug("HeartbeatManager: set_meta failed: %s", exc)
+
+
+@dataclass(frozen=True)
+class ChannelHeartbeatRoute:
+    """Exact durable conversation lane, including the receiving bot and runtime profile."""
+
+    session_key: str
+    transport_profile: str
+    runtime_profile: str
+    platform: str
+    chat_id: str
+    thread_id: Optional[str]
+    scope_id: Optional[str]
+
+    def __post_init__(self):
+        if not all(isinstance(value, str) and value for value in (
+                self.session_key, self.transport_profile, self.runtime_profile, self.platform, self.chat_id)):
+            raise ValueError("channel heartbeat requires an exact route and profile")
+
+    @property
+    def meta_key(self) -> str:
+        # JSON preserves delimiters and nulls without aliasing platform-specific IDs.
+        return self.key_prefix(self.session_key) + json.dumps(asdict(self), sort_keys=True, separators=(",", ":"))
+
+    @staticmethod
+    def key_prefix(session_key: str) -> str:
+        return "heartbeat:channel:" + json.dumps(session_key, ensure_ascii=False) + ":"
+
+
+DEFAULT_CHANNEL_PROMPT = (
+    "Review the current conversation's context, explicit commitments and active goals. "
+    "Take the next useful authorized step or report a meaningful change. Respect the user's "
+    "policy and quiet hours; do not turn casual mentions into obligations, invent work, "
+    "or duplicate cron jobs. If nothing warrants a message, finish with NO_REPLY."
+)
+
+CHANNEL_HEARTBEAT_PROMPT_TEMPLATE = (
+    "[Heartbeat — recurring channel instruction, fires every {interval}]\n{prompt}\n\n"
+    "Use the current conversation, not an archived session's commitments. "
+    "Respect policy, quiet hours and authorization; do not invent work or duplicate cron jobs. "
+    "If nothing meaningful warrants a message now, finish with NO_REPLY."
+)
 
 
 class HeartbeatManager:
@@ -246,6 +292,107 @@ class HeartbeatManager:
         return True
 
 
+class ChannelHeartbeatManager(HeartbeatManager):
+    """Channel schedule over the existing state/driver contract, with atomic durable claims.
+
+    A manager captures its owning DB, so delayed admission refunds never use another profile's
+    ambient scope. Every mutation reads the current row inside the writer transaction; stale
+    manager instances cannot resurrect pauses/clears or reserve the same tick twice.
+    """
+
+    def __init__(self, route: ChannelHeartbeatRoute):
+        self.route = route
+        self.session_id = route.session_key
+        db = _get_session_db()
+        if db is None:
+            raise RuntimeError("channel heartbeat persistence unavailable")
+        self._db: Any = db
+        self._claim: Optional[tuple[str, str]] = None
+        self._state = self._decode(self._db.get_meta(route.meta_key))
+
+    def _decode(self, raw):
+        if not raw:
+            return None
+        data = json.loads(raw)
+        if data["route"] != asdict(self.route):
+            raise ValueError("channel heartbeat route mismatch")
+        state = HeartbeatState.from_json(json.dumps(data["state"]))
+        return None if state.status == "cleared" else state
+
+    def _encode(self, state):
+        return json.dumps({"route": asdict(self.route), "state": asdict(state),
+                           "revision": uuid.uuid4().hex}, ensure_ascii=False)
+
+    def _change(self, transition):
+        def write(conn):
+            row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (self.route.meta_key,)).fetchone()
+            raw = row[0] if row else None
+            state, result = transition(self._decode(raw), raw)
+            self._state = state if state is not None else self._decode(raw)
+            if state is not None:
+                updated = self._encode(state)
+                self._db.set_meta(self.route.meta_key, updated, cursor=conn.cursor())
+                if result == "claim":
+                    assert raw is not None
+                    self._claim = (raw, updated)
+            return result
+        return self._db._execute_write(write)
+
+    def set(self, prompt: str, interval_seconds: int) -> HeartbeatState:
+        prompt = (prompt or "").strip()
+        if not prompt or interval_seconds < MIN_INTERVAL_SECONDS:
+            raise ValueError("channel heartbeat requires a prompt and interval of at least 60s")
+        state = HeartbeatState(prompt, int(interval_seconds), created_at=time.time())
+        self._change(lambda _state, _raw: (state, state))
+        return state
+
+    def _set_status(self, status: str, *, reanchor: bool = False):
+        def change(state, raw):
+            if state is None:
+                return None, None
+            state.status = status
+            if reanchor:
+                state.last_fired_at = time.time()
+            return state, state
+        return self._change(change)
+
+    def due_prompt(self, now=None):
+        now = time.time() if now is None else now
+        def claim(state, raw):
+            if state is None or not state.is_due(now):
+                return None, None
+            state.last_fired_at = now
+            state.fire_count += 1
+            return state, "claim"
+        if self._change(claim) != "claim":
+            return None
+        assert self._state is not None
+        return CHANNEL_HEARTBEAT_PROMPT_TEMPLATE.format(
+            interval=format_interval(self._state.interval_seconds), prompt=self._state.prompt)
+
+    @property
+    def claim_receipt(self) -> Optional[str]:
+        return self._claim[1] if self._claim is not None else None
+
+    def owns_claim(self, receipt: Optional[str]) -> bool:
+        return bool(receipt and self.is_active() and self._db.get_meta(self.route.meta_key) == receipt)
+
+    def abandon_fire(self) -> bool:
+        if self._claim is None:
+            return False
+        before, claimed = self._claim
+        def refund(conn):
+            row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (self.route.meta_key,)).fetchone()
+            if row is None or row[0] != claimed:
+                return False
+            self._db.set_meta(self.route.meta_key, before, cursor=conn.cursor())
+            self._state = self._decode(before)
+            return True
+        refunded = self._db._execute_write(refund)
+        self._claim = None
+        return refunded
+
+
 def migrate_heartbeat_to_session(old_session_id: str, new_session_id: str) -> bool:
     """Carry a heartbeat across a compression session rotation (copy to child, archive parent, never raise).
 
@@ -269,4 +416,6 @@ def migrate_heartbeat_to_session(old_session_id: str, new_session_id: str) -> bo
 __all__ = [
     "HeartbeatState", "HeartbeatManager", "parse_interval", "format_interval", "load_heartbeat", "save_heartbeat",
     "migrate_heartbeat_to_session", "HEARTBEAT_PROMPT_TEMPLATE", "MIN_INTERVAL_SECONDS", "POLL_SECONDS",
+    "ChannelHeartbeatRoute", "ChannelHeartbeatManager", "DEFAULT_CHANNEL_PROMPT",
+    "CHANNEL_HEARTBEAT_PROMPT_TEMPLATE",
 ]

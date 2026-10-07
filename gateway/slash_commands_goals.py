@@ -93,17 +93,26 @@ class GatewayGoalCommandsMixin:
         """Handle /heartbeat (mirror of the CLI handler): the session's one recurring re-entry
         prompt. The gateway-wide poller injects due heartbeats through the adapter FIFO as
         ordinary user turns, so alternation and caching hold."""
-        from hermes_cli.heartbeat import parse_interval, format_interval, MIN_INTERVAL_SECONDS
+        from hermes_cli.heartbeat import parse_interval, format_interval, MIN_INTERVAL_SECONDS, DEFAULT_CHANNEL_PROMPT
         args = (event.get_command_args() or "").strip()
+        channel_mode = args.split(None, 1)[0].lower() == "channel" if args else False
+        if channel_mode:
+            args = args[len("channel"):].strip()
         lower = args.lower()
         mgr, _session_entry = await self._get_heartbeat_manager_for_event(event)
         if mgr is None:
             return t("gateway.heartbeat.unavailable")
         quick_key = self._session_key_for_source(event.source) if event.source else None
+        legacy_mgr = mgr
+        if channel_mode:
+            try:
+                mgr = self._channel_heartbeat_manager(event.source, quick_key)
+            except (ValueError, RuntimeError):
+                return "Channel heartbeat unavailable: exact route/profile or durable store unresolved."
 
         def _watch():
             if quick_key and event.source is not None:
-                self._register_heartbeat_watch(quick_key, event.source, mgr.session_id)
+                self._register_heartbeat_watch(quick_key, event.source, _session_entry.session_id)
 
         if not args or lower == "status":
             return mgr.status_line()
@@ -118,6 +127,8 @@ class GatewayGoalCommandsMixin:
             return t("gateway.heartbeat.resumed", interval=format_interval(state.interval_seconds), prompt=state.prompt)
         if lower in {"clear", "stop", "off"}:
             had = mgr.clear()
+            if channel_mode:
+                legacy_mgr.clear()
             if quick_key:
                 self._unregister_heartbeat_watch(quick_key)
             return t("gateway.heartbeat.cleared") if had else t("gateway.heartbeat.none_set")
@@ -135,11 +146,21 @@ class GatewayGoalCommandsMixin:
             return t("gateway.heartbeat.usage")
         if interval < 0:
             return t("gateway.heartbeat.interval_too_small", min_seconds=MIN_INTERVAL_SECONDS)
+        if channel_mode and not prompt.strip():
+            prompt = DEFAULT_CHANNEL_PROMPT
         if not prompt.strip():
             return t("gateway.heartbeat.prompt_required")
+        if not channel_mode:
+            try:
+                if self._channel_heartbeat_manager(event.source, quick_key).has_heartbeat():
+                    return "A channel heartbeat already owns this route. Use /heartbeat channel clear first."
+            except ValueError:
+                pass
         state, err = _mgr_call(t("gateway.heartbeat.invalid_prefix"), mgr.set, prompt, interval, errors=(ValueError,))
         if err:
             return err
+        if channel_mode:
+            legacy_mgr.clear()
         _watch()
         return t("gateway.heartbeat.set", interval=format_interval(state.interval_seconds), prompt=state.prompt)
 

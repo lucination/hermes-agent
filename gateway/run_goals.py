@@ -8,7 +8,6 @@ so ``patch("gateway.run.X")`` keeps intercepting them at call time.
 from __future__ import annotations
 
 import asyncio
-import dataclasses
 import logging
 import time
 from contextlib import nullcontext, suppress
@@ -98,6 +97,32 @@ class GatewayGoalsMixin:
             return lambda sid: HeartbeatManager(session_id=sid)
         return await self._manager_for_event(event, "heartbeat", _load)
 
+    def _channel_heartbeat_manager(self, source, quick_key):
+        """Resolve the exact route in the already-bound profile; unknown ownership fails closed."""
+        from gateway.session_identity import canonical_identity
+        from hermes_cli.heartbeat import ChannelHeartbeatManager, ChannelHeartbeatRoute
+        from hermes_constants import get_hermes_home
+
+        identity = canonical_identity(source, runner=self)
+        if (identity is None or identity.runtime_home.resolve() != get_hermes_home().resolve()
+                or (identity.multiplexed and identity.transport_inferred)
+                or self._session_key_for_source(source) != quick_key):
+            raise ValueError("channel heartbeat route/profile unresolved")
+        return ChannelHeartbeatManager(ChannelHeartbeatRoute(
+            quick_key, identity.transport_profile, identity.runtime_profile,
+            source.platform.value, source.chat_id, source.thread_id, source.scope_id))
+
+    def _heartbeat_manager_for_route(self, source, quick_key, session_id):
+        from hermes_cli.heartbeat import HeartbeatManager, ChannelHeartbeatRoute, _get_session_db
+
+        db = _get_session_db()
+        if (getattr(self, "session_store", None) is not None and quick_key.startswith("agent:")
+                and db is not None and db.list_meta_prefix(ChannelHeartbeatRoute.key_prefix(quick_key))):
+            channel = self._channel_heartbeat_manager(source, quick_key)
+            if channel.has_heartbeat():
+                return channel
+        return HeartbeatManager(session_id)
+
     @staticmethod
     def _synthetic_prompt_event(source: Any, text: str, *, internal: bool = False) -> MessageEvent:
         """Build the TEXT event used to inject a goal/heartbeat/loop prompt into a session.
@@ -106,7 +131,8 @@ class GatewayGoalsMixin:
         prompt is not a reply to it, so it is dropped or every progress bubble and final reply
         would quote that stale message (Telegram DM topics route anchorless via the topic id).
         """
-        source = dataclasses.replace(source, message_id=None) if getattr(source, "message_id", None) else source
+        from gateway.session_identity import replace_source
+        source = replace_source(source, message_id=None) if getattr(source, "message_id", None) else source
         return MessageEvent(text=text, message_type=MessageType.TEXT, source=source, internal=internal)
 
     def _register_heartbeat_watch(self, quick_key: str, source: Any, session_id: str) -> None:
@@ -139,6 +165,10 @@ class GatewayGoalsMixin:
                 return
             session_id = current
             watch[quick_key] = (source, session_id)
+            if hasattr(store, "lookup_by_session_key"):
+                entry = store.lookup_by_session_key(quick_key)
+                if entry is None or entry.suspended:
+                    return
         adapter = self._delivery_adapter_for(source)
         if adapter is None or not adapter._message_handler:
             return
@@ -152,9 +182,9 @@ class GatewayGoalsMixin:
 
         if check_paused("heartbeat", logger):
             return  # `hermes pause`: leave the tick unclaimed so it fires after `hermes resume`
-        from hermes_cli.heartbeat import HeartbeatManager
+        from hermes_cli.heartbeat import ChannelHeartbeatManager
 
-        mgr = HeartbeatManager(session_id=session_id)
+        mgr = self._heartbeat_manager_for_route(source, quick_key, session_id)
         if not mgr.has_heartbeat():
             watch.pop(quick_key, None)
             return
@@ -167,6 +197,9 @@ class GatewayGoalsMixin:
         # Provenance read by display_kind_for_event / the turn's quiet surfaces; the event stays
         # non-internal so authorization and the emergency stop still apply.
         event._heartbeat_session_id = session_id
+        if isinstance(mgr, ChannelHeartbeatManager):
+            event._heartbeat_channel_route = mgr.route
+            event._heartbeat_channel_claim = mgr.claim_receipt
         # A pinned route skips topic recovery: no await between the idle
         # check and adapter claim. FIFO alone never wakes an idle session.
         try:

@@ -1,6 +1,7 @@
 """Heartbeat ownership follows compression, but ends at a conversation boundary."""
 
 from gateway.config import GatewayConfig, Platform
+from gateway.run import GatewayRunner  # bootstrap before the per-test real-home IO guard
 from gateway.session import SessionSource, SessionStore
 from hermes_cli.heartbeat import (
     HeartbeatManager,

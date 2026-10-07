@@ -432,7 +432,14 @@ class GatewayTurnMixin:
 
         strict_session = bool(event_metadata.get("gateway_session_strict"))
         pinned_session_id = str(event_metadata.get("gateway_session_id") or "").strip()
-        if strict_session:
+        if getattr(event, "_heartbeat_channel_route", None) is not None:
+            # An autonomous channel tick observes the current lane, never creates or
+            # reactivates it. Normal resolution consumes /stop suspension by replacing
+            # the session; only subsequent human activity may make that transition.
+            session_entry = await self.async_session_store.lookup_by_session_key(expected_session_key)
+            if session_entry is None or session_entry.suspended:
+                return
+        elif strict_session:
             session_entry = await self.async_session_store.lookup_by_session_key(expected_session_key)
             if session_entry is None or not pinned_session_id or session_entry.session_id != pinned_session_id:
                 logger.warning(
@@ -2183,9 +2190,6 @@ class GatewayTurnMixin:
                 return
             _run_start_session_id = session_entry.session_id
             _turn_started_monotonic = time.monotonic()
-            # Admission/typing is not execution. All routing, authorization and
-            # turn preparation gates have passed when the agent runner is entered.
-            event._heartbeat_execution_started = True
             # Internal events reuse the last human turn's channel inputs (see _pinned_channel_inputs).
             _turn_channel_prompt, _turn_source = self._pinned_channel_inputs(
                 session_key, event.channel_prompt, source, internal=event.internal,
@@ -2194,6 +2198,11 @@ class GatewayTurnMixin:
                 # Persist the coherent context+channel pair before execution: a crash during the
                 # human turn may be followed by an internal startup-resume on the next process.
                 await self._persist_prompt_pins(session_key, _run_start_session_id)
+            # Prompt-pin persistence yields to pause/clear/replacement and lane changes.
+            # Revalidate after the last await; rejected/cancelled attempts remain refundable.
+            if not heartbeat_owner_is_current(self, event, session_key):
+                return
+            event._heartbeat_execution_started = True
             agent_result = await self._run_agent(
                 message=message_text, context_prompt=prepared.context_prompt, history=history, source=_turn_source,
                 session_id=_run_start_session_id, session_key=session_key,
