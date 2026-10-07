@@ -12,6 +12,7 @@ from urllib.parse import quote
 import pytest
 
 import gateway.platforms.base as base_platform
+import gateway.run  # bootstrap before the per-test real-home IO guard
 from gateway.config import Platform, PlatformConfig, StreamingConfig
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.platforms.event import MessageEvent, MessageType

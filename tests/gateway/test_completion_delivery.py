@@ -930,7 +930,16 @@ def test_unavailable_delivery_preserves_budget_across_restarts(tmp_path, unavail
             api._ensure_session_db = lambda: db
             runner.adapters = {Platform.API_SERVER: api}
         if unavailable == "owner_db":
-            runner._session_db = SimpleNamespace(get_session=AsyncMock(return_value={"ended_at": None}))
+            from gateway.config import GatewayConfig
+            from gateway.session import SessionSource, SessionStore
+            from hermes_state import AsyncSessionDB
+            runner.session_store = SessionStore(tmp_path / "owner-sessions", GatewayConfig())
+            entry = runner.session_store.get_or_create_session(
+                SessionSource(platform=Platform.TELEGRAM, chat_id="12345", thread_id="678"))
+            assert entry.session_key == events[0]["session_key"]
+            runner.session_store._db.create_session("parent-session", source="telegram", session_key=entry.session_key)
+            runner.session_store.switch_session(entry.session_key, "parent-session")
+            runner._session_db = AsyncSessionDB(runner.session_store._db)
         assert asyncio.run(runner._deliver_async_delegation_group(events)) is True
         for event in events:
             row = async_delegation.get_durable_delegation(event["delegation_id"])

@@ -22,8 +22,10 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from gateway.config import Platform
+from gateway.config import GatewayConfig, Platform
 from gateway.run import GatewayRunner
+from gateway.session import SessionSource, SessionStore
+from hermes_constants import get_hermes_home
 from tools.process_registry import ProcessRegistry, ProcessSession
 
 
@@ -57,10 +59,10 @@ def _runner(adapter, *, session_db=...):
     runner = object.__new__(GatewayRunner)
     runner._running = True
     runner.adapters = {Platform.TELEGRAM: adapter}
-    runner.session_store = SimpleNamespace(
-        _ensure_loaded=lambda: None,
-        _entries={},
-    )
+    runner.session_store = SessionStore(get_hermes_home() / "sessions", GatewayConfig())
+    entry = runner.session_store.get_or_create_session(SessionSource(platform=Platform.TELEGRAM, chat_id="123"))
+    # A live spawning session must own the route, not merely exist in SQLite.
+    runner.session_store.switch_session(entry.session_key, "sess-live")
     runner._session_source_cache = {}
     runner._completion_delivery_lock = __import__("threading").Lock()
     runner._completion_deliveries_inflight = set()
@@ -218,7 +220,7 @@ def test_completion_after_idle_end_still_delivers(
     )
 
     _run_watcher(
-        monkeypatch, runner, _watcher("proc_boundary", "sess-idle"),
+        monkeypatch, runner, _watcher("proc_boundary", "sess-live"),
     )
 
     adapter.handle_message.assert_awaited_once()

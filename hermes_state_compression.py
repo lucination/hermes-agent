@@ -752,6 +752,57 @@ class SessionCompressionMixin:
         chain = self.get_compression_chain(session_id)
         return chain[-1] if chain else session_id
 
+    def get_unique_compression_tip(self, session_id: str, *, session_key: str = "") -> Optional[str]:
+        """Prove one live conversation continuation, never rank competing siblings.
+
+        Closed non-compression siblings cannot continue a conversation. Every remaining
+        edge must be unique and stay in the root's profile and routing lane. Unlike the
+        display-oriented preferred-tip selector, ambiguity and cycles return None.
+        """
+        with self._read_ctx() as conn:
+            root = conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
+            if root is None:
+                return None
+            key = session_key or root["session_key"] or ""
+            profile = root["profile_name"]
+            current = root
+            seen = set()
+            for _ in range(_CHAIN_CAP):
+                if current["id"] in seen:
+                    return None
+                seen.add(current["id"])
+                if (current["profile_name"] != profile
+                        or (key and current["session_key"] and current["session_key"] != key)):
+                    return None
+                try:
+                    config = json.loads(current["model_config"] or "{}")
+                except (ValueError, TypeError):
+                    return None
+                if (not isinstance(config, dict)
+                        or any(config.get(marker) is not None for marker in ("_delegate_from", "_branched_from", "_reset_from"))
+                        or current["source"] in {"subagent", "tool"}
+                        or current["created_source"] in {"subagent", "tool"}):
+                    return None
+                if current["ended_at"] is None:
+                    return current["id"]
+                if current["end_reason"] != "compression":
+                    return None
+                children = conn.execute(
+                    f"""SELECT child.* FROM sessions child
+                    WHERE child.parent_session_id = ?
+                      AND (child.ended_at IS NULL OR child.end_reason = 'compression')
+                      AND {_sql_json_extract('child.model_config', '$._branched_from')} IS NULL
+                      AND {_sql_json_extract('child.model_config', '$._delegate_from')} IS NULL
+                      AND NOT ({_RESET_CHILD_SQL.format(a='child')})
+                      AND COALESCE(child.source, '') NOT IN ('tool', 'subagent')
+                      AND COALESCE(child.created_source, '') NOT IN ('tool', 'subagent')
+                    LIMIT 2""", (current["id"],),
+                ).fetchall()
+                if len(children) != 1:
+                    return None
+                current = children[0]
+        return None
+
     def _is_compression_child_row(self, child: Dict[str, Any]) -> bool:
         parent_id = child.get("parent_session_id")
         # A reset fork of a compression-ended parent is its own conversation, not the continuation (#114271).

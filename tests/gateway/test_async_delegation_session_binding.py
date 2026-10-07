@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 import tools.async_delegation as ad
+from gateway.run import GatewayRunner
 
 
 @pytest.fixture(autouse=True)
@@ -78,7 +79,7 @@ class TestGatewayPinningFailsClosed:
         runner = object.__new__(GatewayRunner)
         db = MagicMock()
         db.get_session = AsyncMock(side_effect=lambda session_id: rows.get(session_id))
-        db.get_compression_tip = AsyncMock(
+        db.get_unique_compression_tip = AsyncMock(
             return_value=compression_tip,
             side_effect=compression_error,
         )
@@ -87,6 +88,12 @@ class TestGatewayPinningFailsClosed:
         runner.session_store.switch_session = MagicMock(return_value=switched_entry)
         runner.session_store.advance_compression_session = MagicMock(
             return_value=switched_entry
+        )
+        runner.session_store.stage_compression_session = MagicMock(
+            return_value=(switched_entry, ({}, 1)) if switched_entry is not None else None
+        )
+        runner.session_store.peek_session_id = MagicMock(
+            return_value=switched_entry.session_id if switched_entry is not None else None
         )
         runner._async_session_store = AsyncSessionStore(runner.session_store)
         return runner
@@ -100,7 +107,7 @@ class TestGatewayPinningFailsClosed:
 
 
     @pytest.mark.asyncio
-    async def test_live_spawning_session_rebinds_from_different_route(self):
+    async def test_live_unrelated_session_cannot_rebind_route(self):
         current = self._entry("sess_current")
         pinned = self._entry("sess_live")
         runner = self._make_runner(
@@ -112,10 +119,8 @@ class TestGatewayPinningFailsClosed:
             current, "sess_live"
         )
 
-        assert resolved is pinned
-        getattr(runner.session_store, "switch_session").assert_called_once_with(
-            current.session_key, "sess_live", expected_session_id=current.session_id,
-        )
+        assert resolved is None
+        self._assert_no_route_change(runner)
 
     @pytest.mark.asyncio
     async def test_non_compression_ended_parent_drops(self):
@@ -170,9 +175,9 @@ class TestGatewayPinningFailsClosed:
         )
 
         assert resolved is tip
-        getattr(
-            runner.session_store, "advance_compression_session"
-        ).assert_called_once_with(current.session_key, "sess_middle", "sess_tip")
+        args, kwargs = runner.session_store.stage_compression_session.call_args
+        assert args == (current.session_key, "sess_middle", "sess_tip")
+        assert kwargs["is_current"]()
 
     @pytest.mark.asyncio
     async def test_compression_parent_follows_real_sessiondb_lineage(self, tmp_path):
@@ -196,6 +201,8 @@ class TestGatewayPinningFailsClosed:
         runner.session_store = MagicMock()
         runner.session_store.switch_session = MagicMock(return_value=tip)
         runner.session_store.advance_compression_session = MagicMock(return_value=tip)
+        runner.session_store.stage_compression_session = MagicMock(return_value=(tip, ({}, 1)))
+        runner.session_store.peek_session_id = MagicMock(return_value="sess_tip")
         runner._async_session_store = AsyncSessionStore(runner.session_store)
 
         resolved = await runner._resolve_async_delegation_session(
@@ -203,15 +210,15 @@ class TestGatewayPinningFailsClosed:
         )
 
         assert resolved is tip
-        getattr(
-            runner.session_store, "advance_compression_session"
-        ).assert_called_once_with(current.session_key, "sess_parent", "sess_tip")
+        args, kwargs = runner.session_store.stage_compression_session.call_args
+        assert args == (current.session_key, "sess_parent", "sess_tip")
+        assert kwargs["is_current"]()
 
 
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("boundary", ["none", "revoke", "replace"])
+@pytest.mark.parametrize("boundary", ["none", "revoke", "replace", "route_only"])
 async def test_pending_pin_respects_concurrent_boundary(tmp_path, boundary):
     """A non-compression re-pin that resolved its row across an await must not move the route
     after the run was invalidated (/stop) or the route was replaced (/new, /resume) meanwhile;
@@ -239,14 +246,14 @@ async def test_pending_pin_respects_concurrent_boundary(tmp_path, boundary):
         return {"id": session_id, "ended_at": None}
 
     runner._session_db = SimpleNamespace(get_session=AsyncMock(side_effect=get_session))
-    task = asyncio.create_task(runner._resolve_async_delegation_session(entry, "test-pinned"))
+    task = asyncio.create_task(runner._resolve_async_delegation_session(entry, entry.session_id))
     await asyncio.wait_for(entered.wait(), 3)
-    expected = "test-pinned"
-    if boundary != "none":
+    expected = entry.session_id
+    if boundary in {"revoke", "replace"}:
         runner._invalidate_session_run_generation(entry.session_key, reason="test boundary")
         assert not runner._is_session_run_current(entry.session_key, generation)
         expected = entry.session_id
-    if boundary == "replace":
+    if boundary in {"replace", "route_only"}:
         store.switch_session(entry.session_key, "test-replacement")
         expected = "test-replacement"
     release.set()
@@ -257,3 +264,45 @@ async def test_pending_pin_respects_concurrent_boundary(tmp_path, boundary):
         assert result is not None and result.session_id == expected
     else:
         assert result is None
+
+
+@pytest.mark.asyncio
+async def test_stop_during_offloaded_compression_advance_does_not_mutate_route(tmp_path, monkeypatch):
+    import asyncio
+    import threading
+    from gateway.config import GatewayConfig, Platform
+    from gateway.session import AsyncSessionStore, SessionSource, SessionStore
+    from hermes_state import AsyncSessionDB
+
+    store = SessionStore(tmp_path / "sessions", GatewayConfig())
+    entry = store.get_or_create_session(SessionSource(platform=Platform.TELEGRAM, chat_id="stop-race"))
+    root = entry.session_id
+    store._db.end_session(root, end_reason="compression")
+    store._db.create_session("advance-tip", source="telegram", parent_session_id=root)
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = store
+    runner._async_session_store = AsyncSessionStore(store)
+    runner._session_db = AsyncSessionDB(store._db)
+    generation = runner._begin_session_run_generation(entry.session_key)
+    entered, release = threading.Event(), threading.Event()
+    original = runner.async_session_store.advance_compression_session
+
+    async def gated_advance(*args, **kwargs):
+        def pause():
+            entered.set()
+            assert release.wait(5)
+        await asyncio.to_thread(pause)
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(runner.async_session_store, "advance_compression_session", gated_advance)
+    task = asyncio.create_task(runner._resolve_async_delegation_session(entry, root))
+    try:
+        assert await asyncio.to_thread(entered.wait, 5)
+        runner._invalidate_session_run_generation(entry.session_key, reason="/stop during advance")
+        release.set()
+        assert await asyncio.wait_for(task, 5) is None
+        assert not runner._is_session_run_current(entry.session_key, generation)
+        assert store.peek_session_id(entry.session_key) == root
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)

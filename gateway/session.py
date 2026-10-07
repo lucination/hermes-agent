@@ -767,6 +767,20 @@ class AsyncSessionStore:
     def __init__(self, store: "SessionStore") -> None:
         self._store = store
 
+    async def advance_compression_session(
+        self, session_key: str, expected_session_id: str, target_session_id: str, *, is_current,
+    ) -> Optional[SessionEntry]:
+        """Keep the guarded in-memory transition on the loop that owns run generations."""
+        await asyncio.to_thread(self._store._ensure_loaded)
+        staged = self._store.stage_compression_session(
+            session_key, expected_session_id, target_session_id, is_current=is_current,
+        )
+        if staged is None:
+            return None
+        entry, snapshot = staged
+        await asyncio.to_thread(self._store._persist_routing_data, *snapshot)
+        return entry if is_current() else None
+
     def __getattr__(self, name: str):
         attr = getattr(self._store, name)
         if not callable(attr):
@@ -1054,11 +1068,25 @@ class SessionStore(
         decision.needs_save = True
         if current is not candidate:
             return None
-        return self._session_create_kwargs(
+        create_kwargs = self._session_create_kwargs(
             session_id=session_id, session_key=session_key, origin=source,
             source_value=source.platform.value, display_name=source.chat_name,
             parent_session_id=decision.prev_session_id,
         )
+        if observed is not None and decision.needs_recover and not decision.reset_reason:
+            # Stale idle/timeout rows are not reopenable: record the actual route we
+            # replaced, rather than treating every row with this peer key as an owner.
+            from gateway.completion_ownership import RECOVERY_END_REASONS, owner_edge, OwnerEdge
+            db = self._db_for_key(session_key)
+            predecessor = db.get_session(observed.session_id) if db is not None else None
+            if (predecessor is not None and predecessor.get("ended_at")
+                    and predecessor.get("end_reason") in RECOVERY_END_REASONS
+                    and owner_edge(predecessor) is OwnerEdge.CONVERSATION
+                    and predecessor.get("session_key") == session_key
+                    and predecessor.get("profile_name") == (source.profile or "default")):
+                create_kwargs["parent_session_id"] = observed.session_id
+                create_kwargs["model_config"] = {"_recovered_from": observed.session_id}
+        return create_kwargs
 
     def update_session(
         self, session_key: str, last_prompt_tokens: int = None, touch_activity: bool = True,

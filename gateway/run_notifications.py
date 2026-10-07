@@ -209,10 +209,11 @@ class GatewayNotificationsMixin:
 
     async def _resolve_compression_lineage_target(
         self, session_db: Any, session_entry: SessionEntry, pinned_session_id: str,
+        *, owning_profile: Optional[str] = None,
     ) -> Optional[str]:
         """Return the live compression tip of ``pinned_session_id`` if the route owns that lineage, else None."""
         try:
-            target_session_id = await session_db.get_compression_tip(pinned_session_id)
+            target_session_id = await session_db.get_unique_compression_tip(pinned_session_id)
         except Exception:
             logger.debug("Async-delegation compression-tip lookup failed for %s", pinned_session_id, exc_info=True)
             target_session_id = None
@@ -232,13 +233,18 @@ class GatewayNotificationsMixin:
                 target_session_id, "unknown" if tip_row is None else "ended",
             )
             return None
+        from gateway.completion_ownership import OwnerEdge, owner_edge
+        if (owner_edge(tip_row) is not OwnerEdge.CONVERSATION
+                or (owning_profile is not None and tip_row.get("profile_name") != owning_profile)
+                or (tip_row.get("session_key") and tip_row["session_key"] != session_entry.session_key)):
+            return None
         route_owns_lineage = session_entry.session_id in {pinned_session_id, target_session_id}
         if not route_owns_lineage:
             # Across several rotations, accept a stale route only when its own tip is the same live target.
             try:
                 route_row = await session_db.get_session(session_entry.session_id)
                 route_tip = (
-                    await session_db.get_compression_tip(session_entry.session_id)
+                    await session_db.get_unique_compression_tip(session_entry.session_id)
                     if route_row is not None
                     and route_row.get("ended_at")
                     and route_row.get("end_reason") == "compression"
@@ -256,6 +262,33 @@ class GatewayNotificationsMixin:
             return None
         return target_session_id
 
+    async def _completion_route_target(
+        self, session_db, session_entry: SessionEntry, pinned_session_id: str, pinned_row,
+    ) -> Optional[str]:
+        """Read-only ownership policy shared by preflight and the turn resolver."""
+        from gateway.run import _USER_BOUNDARY_END_REASONS
+        if not pinned_row.get("ended_at"):
+            return pinned_session_id if pinned_session_id == session_entry.session_id else None
+        end_reason = str(pinned_row.get("end_reason") or "")
+        if end_reason in _USER_BOUNDARY_END_REASONS:
+            return None
+        if end_reason != "compression":
+            # Same-route idle ends remain deliverable. A different route needs the
+            # recovery edge recorded when SessionStore actually replaced that route.
+            if pinned_session_id == session_entry.session_id:
+                return pinned_session_id
+            from gateway.completion_ownership import ConversationOwner, recovery_route_is_owned
+            if await recovery_route_is_owned(
+                session_db, ConversationOwner(pinned_session_id, pinned_row),
+                session_entry.session_id, session_key=session_entry.session_key,
+            ):
+                return session_entry.session_id
+            return None
+        return await self._resolve_compression_lineage_target(
+            session_db, session_entry, pinned_session_id,
+            owning_profile=pinned_row.get("profile_name"),
+        )
+
     async def _resolve_async_delegation_session(
         self, session_entry: SessionEntry, pinned_session_id: str,
     ) -> Optional[SessionEntry]:
@@ -265,7 +298,6 @@ class GatewayNotificationsMixin:
         late completion override an unrelated /new or restored route. Unknown ownership fails
         closed; the result stays in the delegation records.
         """
-        from gateway.run import _USER_BOUNDARY_END_REASONS
         session_db = cast(Any, self._session_db)
         if session_db is None:
             logger.warning(
@@ -277,8 +309,14 @@ class GatewayNotificationsMixin:
         # Snapshot the run generation before the row lookup awaits: a /stop or /new landing while
         # the lookup is pending must not let this completion re-point the route afterwards.
         run_generation = self._current_session_run_generation(session_entry.session_key)
+        route_entry = dataclasses.replace(session_entry)
         try:
-            pinned_row = await session_db.get_session(pinned_session_id)
+            from gateway.completion_ownership import resolve_conversation_owner
+            owner = await resolve_conversation_owner(
+                session_db, pinned_session_id, session_key=session_entry.session_key,
+            )
+            if owner is not None:
+                pinned_session_id, pinned_row = owner.session_id, owner.row
         except Exception:
             logger.debug("Async-delegation parent lookup failed for %s", pinned_session_id, exc_info=True)
         if pinned_row is None:
@@ -287,35 +325,19 @@ class GatewayNotificationsMixin:
                 "dropping injection (#55578 fail-closed).", pinned_session_id,
             )
             return None
-        target_session_id = pinned_session_id
-        follows_compression = False
-        if pinned_row.get("ended_at"):
-            _end_reason = str(pinned_row.get("end_reason") or "")
-            if _end_reason in _USER_BOUNDARY_END_REASONS:
-                logger.warning(
-                    "Async-delegation completion pinned to user-closed session %s "
-                    "(end_reason=%r); dropping injection instead of resurrecting it "
-                    "(#55578 fail-closed).", pinned_session_id, _end_reason,
-                )
+        if not self._is_session_run_current(session_entry.session_key, run_generation):
+            return None
+        target_session_id = await self._completion_route_target(
+            session_db, route_entry, pinned_session_id, pinned_row,
+        )
+        if target_session_id is None:
+            return None
+        if target_session_id == route_entry.session_id:
+            if (not self._is_session_run_current(session_entry.session_key, run_generation)
+                    or self.session_store.peek_session_id(session_entry.session_key) != target_session_id):
                 return None
-            if _end_reason != "compression":
-                # Idle/timeout end (scale-to-zero norm): the chat route is still valid, so deliver to its
-                # current session rather than drop (the row would be acked then silently lost).
-                logger.info(
-                    "Async-delegation completion pinned to %s-ended session %s; "
-                    "retargeting to the chat's current session %s.",
-                    _end_reason or "idle", pinned_session_id, session_entry.session_id,
-                )
-                return session_entry
-            follows_compression = True
-            target_session_id = await self._resolve_compression_lineage_target(
-                session_db, session_entry, pinned_session_id,
-            )
-            if target_session_id is None:
-                return None
-        if target_session_id == session_entry.session_id:
             return session_entry
-        prior_session_id = session_entry.session_id
+        prior_session_id = route_entry.session_id
         if not self._is_session_run_current(session_entry.session_key, run_generation):
             logger.warning(
                 "Async-delegation completion for routing key %s was invalidated while resolving pinned "
@@ -323,17 +345,14 @@ class GatewayNotificationsMixin:
                 session_entry.session_key, pinned_session_id, prior_session_id,
             )
             return None
-        if follows_compression:
-            switched = await self.async_session_store.advance_compression_session(
-                session_entry.session_key, prior_session_id, target_session_id,
-            )
-        else:
-            # CAS on the session this completion resolved against: a route replaced meanwhile
-            # (/new, /resume) wins over the stale completion.
-            switched = await self.async_session_store.switch_session(
-                session_entry.session_key, target_session_id, expected_session_id=prior_session_id,
-            )
-        if switched is None:
+        # The shared policy permits a different target only for proven compression.
+        switched = await self.async_session_store.advance_compression_session(
+            session_entry.session_key, prior_session_id, target_session_id,
+            is_current=lambda: self._is_session_run_current(session_entry.session_key, run_generation),
+        )
+        if (switched is None
+                or not self._is_session_run_current(session_entry.session_key, run_generation)
+                or self.session_store.peek_session_id(session_entry.session_key) != target_session_id):
             logger.warning(
                 "Async-delegation completion could not bind routing key %s to "
                 "owning session %s (route moved or unknown); dropping injection.",
@@ -1403,7 +1422,7 @@ class GatewayNotificationsMixin:
                 self._completion_deliveries_inflight.add(identity)
             return seen
 
-    async def _classify_completion_target(self, parent_session_id: str) -> str:
+    async def _classify_completion_target(self, parent_session_id: str, *, session_key: str = "") -> str:
         """Classify an async-completion target before adapter acceptance: ``"deliver"`` (spawning
         session live or compression-rotated with a live continuation; the resolver still retargets),
         ``"terminal"`` (parent gone for good — unknown / user boundary like /new; drop the durable row
@@ -1413,12 +1432,35 @@ class GatewayNotificationsMixin:
         if session_db is None:
             return "retry"
         try:
-            parent = await session_db.get_session(parent_session_id)
+            from gateway.completion_ownership import resolve_conversation_owner
+            owner = await resolve_conversation_owner(session_db, parent_session_id, session_key=session_key)
+            parent = owner.row if owner is not None else None
+            if owner is not None:
+                parent_session_id = owner.session_id
         except Exception:
             logger.debug("Async-completion pre-flight parent lookup failed for %s", parent_session_id, exc_info=True)
             return "retry"
         if parent is None:
             return "terminal"
+        session_key = session_key or parent.get("session_key") or ""
+        if session_key.startswith("agent:"):
+            generation = self._current_session_run_generation(session_key)
+            try:
+                entry = await self.async_session_store.lookup_by_session_key(session_key)
+                if entry is None:
+                    return "retry"
+                # SessionEntry is mutable; do not let a concurrent route update rewrite the snapshot.
+                entry = dataclasses.replace(entry)
+                target = await self._completion_route_target(session_db, entry, parent_session_id, parent)
+                if (not self._is_session_run_current(session_key, generation)
+                        or self.session_store.peek_session_id(session_key) != entry.session_id):
+                    return "retry"
+            except Exception:
+                logger.debug("Completion preflight route lookup failed for %s", session_key, exc_info=True)
+                return "retry"
+            if target is not None:
+                return "deliver"
+            return "retry" if parent.get("end_reason") == "compression" else "terminal"
         if not parent.get("ended_at"):
             return "deliver"
         end_reason = str(parent.get("end_reason") or "")
@@ -1427,7 +1469,7 @@ class GatewayNotificationsMixin:
             # ends stay routable and the resolver retargets. Boundary set shared with the resolver.
             return "terminal" if end_reason in _USER_BOUNDARY_END_REASONS else "deliver"
         try:
-            tip_session_id = await session_db.get_compression_tip(parent_session_id)
+            tip_session_id = await session_db.get_unique_compression_tip(parent_session_id)
             if not tip_session_id or tip_session_id == parent_session_id:
                 # Rotation mid-flight: continuation not visible yet. Retry, don't drop.
                 return "retry"
@@ -1437,6 +1479,11 @@ class GatewayNotificationsMixin:
             return "retry"
         if tip is None or tip.get("ended_at"):
             return "retry"
+        from gateway.completion_ownership import OwnerEdge, owner_edge
+        if (owner_edge(tip) is not OwnerEdge.CONVERSATION
+                or (parent.get("profile_name") is not None
+                    and tip.get("profile_name") != parent["profile_name"])):
+            return "terminal"
         return "deliver"
 
     @staticmethod
@@ -1455,7 +1502,9 @@ class GatewayNotificationsMixin:
 
         parent_session_id = str(evt.get("parent_session_id") or "").strip()
         if parent_session_id:
-            verdict = await self._classify_completion_target(parent_session_id)
+            verdict = await self._classify_completion_target(
+                parent_session_id, session_key=str(evt.get("session_key") or ""),
+            )
             if verdict != "deliver":
                 # Definitively closed targets still need the normal terminal disposition.
                 return verdict == "terminal"
@@ -1518,7 +1567,9 @@ class GatewayNotificationsMixin:
         # can still fail closed inside the message pipeline AFTER the adapter accepted, which would falsely
         # acknowledge the durable row as delivered. Verify the target here, before acceptance, and give
         # drops an honest durable disposition.
-        verdict = await self._classify_completion_target(parent_session_id)
+        verdict = await self._classify_completion_target(
+            parent_session_id, session_key=str(evt.get("session_key") or ""),
+        )
         if verdict == "terminal":
             if evt_type == "async_delegation":
                 logger.warning(

@@ -157,6 +157,25 @@ class SessionTranscriptMixin:
         """Return the lock that serializes pending-queue drain boundaries."""
         return self._lazy("_transcript_drain_lock", threading.RLock)
 
+    def stage_compression_session(
+        self, session_key: str, expected_session_id: str, target_session_id: str, *, is_current,
+    ):
+        """Stage a generation-fenced CAS and immutable persistence snapshot.
+
+        Called on the gateway loop after loading off-thread: the generation check and
+        mutation cannot interleave with /stop. Persistence may then run off-thread.
+        """
+        with self._lock:
+            if not self._loaded or not is_current():
+                return None
+            entry = self._entries.get(session_key)
+            if entry is None:
+                return None
+            if entry.session_id != target_session_id:
+                if not self._heal_compression_tip_locked(entry, expected_session_id, target_session_id):
+                    return None
+            return entry, self._snapshot_routing_locked()
+
     def append_to_transcript(self, session_id: str, message: Dict[str, Any], skip_db: bool = False) -> None:
         """Serialize transcript draining across queue migration boundaries. A session with no usable
         store is NOT skipped: the write is queued and counted like any other failed append, so a

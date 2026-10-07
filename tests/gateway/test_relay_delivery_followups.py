@@ -68,6 +68,7 @@ def _runner_with_rows(rows, *, switched_entry=None):
     db.get_compression_tip = AsyncMock(return_value=None)
     runner._session_db = db
     runner.session_store = MagicMock()
+    runner.session_store.peek_session_id.return_value = "sess_current"
     runner.session_store.switch_session = MagicMock(return_value=switched_entry)
     runner.session_store.advance_compression_session = MagicMock(
         return_value=switched_entry
@@ -78,14 +79,13 @@ def _runner_with_rows(rows, *, switched_entry=None):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("end_reason", ["idle", "idle_timeout", "timeout", None, ""])
-async def test_resolver_retargets_idle_ended_pin_to_current_session(end_reason):
-    """The delivery leg the classifier's "deliver" verdict promises: an
-    idle-ended pin must resolve to the chat's CURRENT session, not drop."""
+async def test_resolver_keeps_owned_idle_ended_session(end_reason):
+    """An idle end does not revoke ownership of the very same routed session."""
     current = _entry("sess_current")
     runner = _runner_with_rows(
         {
-            "sess_idle": {
-                "id": "sess_idle",
+            "sess_current": {
+                "id": "sess_current",
                 "ended_at": "2026-08-09T00:00:00",
                 "end_reason": end_reason,
             }
@@ -93,7 +93,7 @@ async def test_resolver_retargets_idle_ended_pin_to_current_session(end_reason):
     )
 
     resolved = await runner._resolve_async_delegation_session(
-        current, "sess_idle"
+        current, "sess_current"
     )
 
     assert resolved is current, (
@@ -135,15 +135,17 @@ async def test_classifier_and_resolver_agree_on_ended_parents(end_reason):
     must drop. Divergence in the deliver->drop direction acks the durable
     row for an injection the pipeline then discards."""
     row = {
-        "id": "sess_x",
+        "id": "sess_current",
+        "session_key": "agent:main:slack:dm:U1",
         "ended_at": "2026-08-09T00:00:00",
         "end_reason": end_reason,
     }
     current = _entry("sess_current")
-    runner = _runner_with_rows({"sess_x": row})
+    runner = _runner_with_rows({"sess_current": row})
+    runner.session_store.lookup_by_session_key.return_value = current
 
-    verdict = await runner._classify_completion_target("sess_x")
-    resolved = await runner._resolve_async_delegation_session(current, "sess_x")
+    verdict = await runner._classify_completion_target("sess_current", session_key=current.session_key)
+    resolved = await runner._resolve_async_delegation_session(current, "sess_current")
 
     if verdict == "deliver":
         assert resolved is not None, (
