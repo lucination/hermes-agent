@@ -168,11 +168,28 @@ def destructive_ops(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     return [op for op in ops if (op or {}).get("action") in _BG_DELETE_ACTIONS]
 
 
+def _background_review_allows_destructive() -> bool:
+    """Only a successful config read can authorize unattended destructive writes."""
+    try:
+        from hermes_cli.config import load_config_readonly
+        from hermes_cli.config_read_errors import FailedConfigRead
+
+        config = load_config_readonly()
+        if isinstance(config, FailedConfigRead):
+            return False
+        return get_builtin_memory_config(config).get("background_review_allow_destructive") is True
+    except Exception:
+        logger.debug("Could not read destructive memory authorization", exc_info=True)
+        return False
+
+
 def _background_delete_gate(store, action, operations, target="memory", content=None,
                             old_text=None) -> Optional[str]:
     """Fail-closed operation gate for unattended background-review forks (#105921): ``add``
-    stays available (it is all any review prompt asks for), while ``replace``/``remove`` —
-    single or inside a batch — are never applied unattended. The op is staged in the pending
+    stays available, while ``replace``/``remove`` — single or inside a batch — require an
+    explicit boolean opt-in from a successful profile config read.
+    Opt-in skips only this gate; ordinary write approval and store validation still apply.
+    Without opt-in, the op is staged in the pending
     store instead of merely denied: the fork's own review summary is never published back, so
     a plain denial would drop the consolidation request with no surfacing path at all. A
     staging failure fails closed to a plain denial."""
@@ -184,6 +201,8 @@ def _background_delete_gate(store, action, operations, target="memory", content=
                if operations is not None else
                {"action": action, "target": target, "content": content, "old_text": old_text})
     if not destructive_ops(payload):
+        return None
+    if _background_review_allows_destructive():
         return None
     detail = ("; ".join(_batch_op_line(op) for op in operations) if operations is not None
               else _batch_op_line({"action": action, "content": content, "old_text": old_text}))

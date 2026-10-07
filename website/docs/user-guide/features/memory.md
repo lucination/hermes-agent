@@ -316,8 +316,27 @@ This is the answer to "the agent saved a wrong assumption about me": set
 `write_approval: true`, and every save — especially the unprompted background
 ones — waits for your yes/no before it ever enters your profile.
 
-A staged `replace` or `remove` (the background review stages these even with the
-gate off) records the full entry it targets, and `/memory pending` shows it.
+### Autonomous background consolidation
+
+By default, unattended background reviews stage `replace` and `remove` proposals,
+including a whole batch containing either operation, even when `write_approval`
+is off. To allow the review to rewrite or forget entries without approval:
+
+```bash
+hermes config set memory.background_review_allow_destructive true
+```
+
+This profile-specific setting defaults to `false`. Only a boolean `true` opts in;
+quoted strings such as `"true"`, numbers and malformed values do not. Autonomous
+consolidation also requires `memory.write_approval: false`: setting
+`write_approval: true` still stages every background write. Foreground turns and
+user-requested attended reviews are unchanged. Disabled memory targets, content
+security checks, matching rules, character budgets and atomic batch validation
+still apply. Opting in permits the review to overwrite or delete durable facts
+in MEMORY.md and USER.md; keep it off if you want to review those decisions.
+
+A staged `replace` or `remove` records the full entry it targets, and
+`/memory pending` shows it.
 Approval applies to exactly that entry: if it changed after the write was staged,
 the write is refused and stays pending for you to reject. A `replace`/`remove`
 staged before this pinning existed has no verifiable target and is refused too:

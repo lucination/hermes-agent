@@ -372,6 +372,20 @@ _MEMORY_ROUTING_BLOCK = (
     "target, that store is the only one enabled — use it and skip the other.\n\n"
 )
 
+_MEMORY_CONSOLIDATION_GUIDANCE = (
+    "\n\nMemory maintenance: cautiously consolidate genuinely redundant entries or correct "
+    "clearly superseded facts; do not rewrite merely for style or delete unrelated durable facts. "
+    "A replace overwrites the whole entry: preserve all still-valid facts, exact identifiers, "
+    "and actual phone-number tokens; never substitute masked/redacted placeholders for real values. "
+    "If the complete original entry or a value is uncertain, leave it unchanged. "
+    "Unattended replace/remove (including batches) are staged for approval by default; they may "
+    "apply directly only with memory.background_review_allow_destructive=true from a successful "
+    "config read. Attended reviews do not require that opt-in. Ordinary write approval and "
+    "validation still apply in either case. Do not replay, approve, or resubmit existing pending "
+    "proposals, and do not retry a write that was staged."
+)
+
+
 _MEMORY_REVIEW_PROMPT = (
     "Review the conversation above and consider saving to memory if appropriate.\n\n"
     "Memory has " + _MEMORY_ROUTING_BLOCK +
@@ -1156,8 +1170,13 @@ def _run_review_fork(
     prompt_extra = f" Exception — these configured tools are also allowed: {extra_list}." if configured_extra_tools else ""
     # Keep the deny/prompt wording in sync with the whitelist: a memory-less review must not
     # tell the model that memory is available, or it will burn iterations on denied calls.
-    memory_phrase_deny = " and memory for notes (add only)" if "memory" in review_whitelist else ""
+    memory_phrase_deny = (
+        " and memory (add; replace/remove subject to memory policy and write approval)"
+        if "memory" in review_whitelist else ""
+    )
     memory_phrase_prompt = "memory and skill " if "memory" in review_whitelist else "skill "
+    # New review user-message tail only; never alter the cached system or inherited history.
+    memory_guidance = _MEMORY_CONSOLIDATION_GUIDANCE if "memory" in review_whitelist else ""
     set_thread_tool_whitelist(
         review_whitelist,
         deny_msg_fmt=(
@@ -1178,7 +1197,7 @@ def _run_review_fork(
                 user_message=(
                     prompt + "\n\nYou can only call " + memory_phrase_prompt +
                     "management tools. Other tools will be denied "
-                    "at runtime — do not attempt them." + prompt_extra
+                    "at runtime — do not attempt them." + prompt_extra + memory_guidance
                 ),
                 conversation_history=_digest_history(messages_snapshot) if _routed else messages_snapshot,
             )
